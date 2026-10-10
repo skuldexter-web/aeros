@@ -58,7 +58,7 @@ except ImportError:  # pragma: no cover  (non-POSIX)
 # ─────────────────────────────────────────────────────────────────────────────
 APP_NAME = "AERØS"
 APP_ID = "AEROS"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SUBTITLE = "passive aircraft tracking"
 GITHUB = "github.com/skuldexter-web"
 HANDLE = "@s.k.7.l.d"
@@ -225,6 +225,43 @@ def dvb_driver_loaded() -> bool:
         return False
 
 
+UBLOX_PRODUCTS = {"01a5": "u-blox 5", "01a6": "u-blox 6", "01a7": "u-blox 7",
+                  "01a8": "u-blox 8/M8", "01a9": "u-blox 9"}
+
+
+def usb_info_for_tty(port: str) -> Optional[Tuple[str, str, str]]:
+    """(vendor_id, product_id, label) of the USB device behind a tty node, else None (UART etc.)."""
+    name = os.path.basename(os.path.realpath(port))
+    path = os.path.realpath(f"/sys/class/tty/{name}/device")
+    for _ in range(6):
+        if os.path.exists(os.path.join(path, "idVendor")):
+            try:
+                with open(os.path.join(path, "idVendor")) as f:
+                    vid = f.read().strip().lower()
+                with open(os.path.join(path, "idProduct")) as f:
+                    pid = f.read().strip().lower()
+            except OSError:
+                return None
+            label = UBLOX_PRODUCTS.get(pid, "u-blox") if vid == "1546" else ""
+            if not label:
+                try:
+                    with open(os.path.join(path, "product")) as f:
+                        label = f.read().strip()
+                except OSError:
+                    label = f"{vid}:{pid}"
+            return vid, pid, label
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return None
+
+
+def is_ublox(port: str) -> bool:
+    info = usb_info_for_tty(port)
+    return bool(info and info[0] == "1546")
+
+
 def find_dump1090(explicit: Optional[str] = None) -> Optional[str]:
     candidates = [explicit, os.environ.get("AEROS_DUMP1090"),
                   "/usr/local/bin/dump1090-aeros",
@@ -333,6 +370,11 @@ def setup_system(args: argparse.Namespace) -> int:
                 '# Written by AERØS\n'
                 'SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", GROUP="plugdev", MODE="0660"\n'
                 'SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", GROUP="plugdev", MODE="0660"\n')
+    _sudo_write("/etc/udev/rules.d/21-aeros-ublox.rules",
+                "# Written by AERØS: u-blox GPS (u-blox 5/6/7/8). Stop ModemManager from probing the port\n"
+                "# with AT commands (breaks NMEA) and let the 'dialout' group read it.\n"
+                'ATTRS{idVendor}=="1546", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"\n'
+                'SUBSYSTEM=="tty", ATTRS{idVendor}=="1546", GROUP="dialout", MODE="0660"\n')
     _run(_priv(["udevadm", "control", "--reload-rules"]))
     _run(_priv(["udevadm", "trigger"]))
     if dvb_driver_loaded():
@@ -586,11 +628,20 @@ class GpsSupervisor(threading.Thread):
             if os.path.exists(extra) and os.path.realpath(extra) not in real:
                 ports.append(extra)
                 real.add(os.path.realpath(extra))
+        ports.sort(key=lambda p: 0 if is_ublox(p) else 1)  # probe u-blox receivers first
         return ports
+
+    @staticmethod
+    def _open_serial(port: str, baud: int, timeout: float):
+        """Open the port exclusively when pyserial supports it, so we never split bytes with gpsd."""
+        try:
+            return serial.Serial(port, baud, timeout=timeout, exclusive=True)
+        except TypeError:  # pyserial < 3.3
+            return serial.Serial(port, baud, timeout=timeout)
 
     def _probe_nmea(self, port: str, baud: int, dwell: float = 2.5) -> bool:
         try:
-            with serial.Serial(port, baud, timeout=0.5) as ser:
+            with self._open_serial(port, baud, 0.5) as ser:
                 end = time.monotonic() + dwell
                 while time.monotonic() < end and not self.stop_evt.is_set():
                     line = ser.readline().decode("ascii", "ignore").strip()
@@ -622,9 +673,10 @@ class GpsSupervisor(threading.Thread):
         if serial is None:
             self._note = "pyserial missing (apt install python3-serial)"
             return
-        name = f"serial {port}@{baud}"
+        info = usb_info_for_tty(port)
+        name = f"serial {port}@{baud}" + (f" ({info[2]})" if info else "")
         try:
-            with serial.Serial(port, baud, timeout=1) as ser:
+            with self._open_serial(port, baud, 1) as ser:
                 self._update(source=name, status="NO FIX", error="")
                 last_ok = time.monotonic()
                 while not self.stop_evt.is_set():
@@ -638,7 +690,10 @@ class GpsSupervisor(threading.Thread):
                         self._status("NO DATA", f"{port} open but no valid NMEA (check baud/wiring)")
         except (OSError, getattr(serial, "SerialException", OSError)) as exc:
             hint = " — add your user to the 'dialout' group" if "ermission" in str(exc) else ""
+            if "lock" in str(exc).lower():
+                hint = " — port is in use (gpsd?); use --gps gpsd or stop gpsd"
             self._note = f"{port}: {exc}{hint}"
+            self._status("DISCONNECTED", self._note)
 
     def _handle_nmea(self, line: str, name: str) -> None:
         body = line[1:line.index("*")]
@@ -1452,6 +1507,19 @@ def run_check(args: argparse.Namespace, distro: Distro, binary: Optional[str]) -
     ports = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*") +
                    [p for p in ("/dev/serial0", "/dev/ttyAMA0") if os.path.exists(p)])
     say(f"serial ports: {', '.join(ports) if ports else 'none'}   pyserial: {'yes' if serial else 'no'}")
+    ublox_seen = False
+    for port in ports:
+        info = usb_info_for_tty(port)
+        if info:
+            ublox_seen = ublox_seen or info[0] == "1546"
+            say(f"  {port}: {info[2]} ({info[0]}:{info[1]})")
+        else:
+            say(f"  {port}: not USB (UART / other)")
+    if ublox_seen and shutil.which("systemctl"):
+        mm = subprocess.run(["systemctl", "is-active", "--quiet", "ModemManager"]).returncode == 0
+        if mm:
+            say(f"{RED}ModemManager is active and may grab the u-blox port; "
+                f"run --setup to install the ignore rule (then replug the GPS){RESET}")
     return 0
 
 

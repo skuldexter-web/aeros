@@ -14,7 +14,7 @@ the top of the terminal while a cyan live table updates underneath.
  ██████  █████   █████   █  █ █   ████
  █    █  █       █   █   ██   █       █
  █    █  ██████  █    █   ████   █████
- passive aircraft tracking · v1.0.0
+ passive aircraft tracking · v1.0.1
 ```
 
 ## Features
@@ -59,6 +59,21 @@ the top of the terminal while a cyan live table updates underneath.
 
 Other serial devices (ESP32 / Arduino dev boards on `/dev/ttyACM*`) can be probed and even reset by
 auto-detection. If you have any plugged in, name your GPS explicitly with `--gps-serial`.
+
+### u-blox 7 (VK-172 / VK-162 / G-Mouse style USB modules)
+
+- Shows up as a USB CDC device, normally `/dev/ttyACM0` (USB ID `1546:01a7`). The baud rate is irrelevant
+  over USB; for a UART-wired NEO-7M use `--gps-baud 9600` (factory default).
+- Factory output is 1 Hz NMEA (GGA, RMC, GSA, GSV, GLL, VTG). AERØS parses GGA/RMC/GSV and accepts both
+  `GP` and `GN` talkers, and sums GPS + GLONASS satellites in view.
+- Without a fix the module still sends NMEA with empty position fields. AERØS shows `NO FIX` and logs nothing.
+  Cold start outdoors is typically under a minute; behind glass or indoors it may never lock.
+- Auto-detection probes u-blox receivers first. `python3 aeros.py --check` prints which port is the u-blox.
+- **ModemManager** (installed by default on Ubuntu, Mint, Kali desktop) can grab `/dev/ttyACM*` and send AT
+  commands to it, which garbles NMEA. `--setup` installs `/etc/udev/rules.d/21-aeros-ublox.rules` telling it to
+  ignore `1546:*` devices; **unplug and replug the GPS afterwards**.
+- Use either gpsd or direct serial on one port, not both. `--gps auto` prefers gpsd.
+- AERØS never reconfigures the receiver (no UBX commands are sent), so your u-blox settings stay untouched.
 
 ## Installation
 
@@ -166,6 +181,7 @@ needed for a trivial conversion script.
 | `USB permission denied` | Re-login after `--setup` (plugdev), or run with `sudo`. |
 | `GPS NO DEVICE` | `python3 aeros.py --check`; start gpsd (`sudo systemctl start gpsd.socket`) or pass `--gps-serial`. |
 | `GPS NO FIX` / "not logging" | Move the antenna outdoors/with sky view; cold start can take several minutes. |
+| `GPS DISCONNECTED … port is in use` | gpsd holds the port: use `--gps gpsd`, or stop gpsd for direct serial. |
 | `serial … Permission denied` | `sudo usermod -aG dialout $USER`, then re-login. |
 | RSSI shows `n/a` | Decoder fell back to SBS mode; use `dump1090-fa` or `readsb`. |
 
