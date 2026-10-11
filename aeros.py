@@ -20,15 +20,16 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import curses
 import dataclasses
 import datetime as dt
 import getpass
 import glob
 import json
+import locale
 import math
 import os
 import re
-import select
 import shlex
 import shutil
 import signal
@@ -46,19 +47,17 @@ try:  # optional: only needed for direct NMEA serial / UART GPS
 except ImportError:  # pragma: no cover
     serial = None
 
-try:
-    import termios
-    import tty
-except ImportError:  # pragma: no cover  (non-POSIX)
-    termios = None
-    tty = None
+from airplanes import (  # noqa: E402  (decoder side lives in airplanes.py)
+    HAVE_PYMODES, PYMODES_ERROR, AircraftTable, AircraftTracker, Dump1090Controller,
+    JsonSource, RssiSource, SbsSource, explain_sdr_error,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Identity / constants
 # ─────────────────────────────────────────────────────────────────────────────
 APP_NAME = "AERØS"
 APP_ID = "AEROS"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 SUBTITLE = "passive aircraft tracking"
 GITHUB = "github.com/skuldexter-web"
 HANDLE = "@s.k.7.l.d"
@@ -87,29 +86,14 @@ def banner_lines(ascii_only: bool = False) -> List[str]:
 
 
 UNIT_FACTORS = {"km": 1.0, "nm": 0.539957, "mi": 0.621371}
-HEX6 = re.compile(r"[0-9A-F]{6}")
 
-# dump1090 launch ladder: tried in order until one stays alive.
-#   json -> decoder writes aircraft.json (gives RSSI)   sbs -> TCP :30003 feed (no RSSI)
-LADDERS = [
-    ("json", ["--device-type", "rtlsdr", "--quiet", "--write-json", "{json}", "--write-json-every", "1"]),
-    ("json", ["--quiet", "--write-json", "{json}", "--write-json-every", "1"]),
-    ("sbs", ["--net", "--quiet"]),
-    ("sbs", ["--net"]),
-]
-HW_ERR = re.compile(
-    r"no supported|no rtl|usb_open error|failed to open|unable to open|cannot open|"
-    r"kernel driver is active|usb_claim_interface|error opening|resource busy|"
-    r"no devices? found|rtlsdr_open|permission denied",
-    re.I,
-)
-BINARY_NAMES = ["dump1090-aeros", "dump1090-fa", "readsb", "dump1090-mutability", "dump1090"]
 COMMON_JSON_DIRS = ["/run/dump1090-fa", "/run/readsb", "/run/dump1090-mutability", "/run/dump1090",
                     "/var/run/dump1090-fa", "/var/run/readsb"]
 
 APT_PACKAGES = [
     "rtl-sdr", "librtlsdr-dev", "gpsd", "gpsd-clients", "python3-pip", "build-essential",
     "git", "pkg-config", "libusb-1.0-0-dev", "libncurses-dev", "python3-serial",
+    "python3-numpy", "python3-zmq",
 ]
 BUILD_TARGETS = [
     ("dump1090-fa", "https://github.com/flightaware/dump1090.git",
@@ -147,15 +131,6 @@ def parse_iso8601(text: str) -> Optional[float]:
         frac = float(m.group(7)) if m.group(7) else 0.0
         return dt.datetime(y, mo, d, h, mi, s, tzinfo=dt.timezone.utc).timestamp() + frac
     except ValueError:
-        return None
-
-
-def to_float(value) -> Optional[float]:
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except (TypeError, ValueError):
         return None
 
 
@@ -225,6 +200,9 @@ def dvb_driver_loaded() -> bool:
         return False
 
 
+UBLOX_VID = "1546"                 # USB vendor ID of u-blox AG
+GPSD_IDENT_GRACE = 12.0            # seconds gpsd gets to identify the receiver as u-blox
+UBX_POLL_MON_VER = bytes([0xB5, 0x62, 0x0A, 0x04, 0x00, 0x00, 0x0E, 0x34])  # read-only version query
 UBLOX_PRODUCTS = {"01a5": "u-blox 5", "01a6": "u-blox 6", "01a7": "u-blox 7",
                   "01a8": "u-blox 8/M8", "01a9": "u-blox 9"}
 
@@ -242,7 +220,7 @@ def usb_info_for_tty(port: str) -> Optional[Tuple[str, str, str]]:
                     pid = f.read().strip().lower()
             except OSError:
                 return None
-            label = UBLOX_PRODUCTS.get(pid, "u-blox") if vid == "1546" else ""
+            label = UBLOX_PRODUCTS.get(pid, "u-blox") if vid == UBLOX_VID else ""
             if not label:
                 try:
                     with open(os.path.join(path, "product")) as f:
@@ -259,21 +237,55 @@ def usb_info_for_tty(port: str) -> Optional[Tuple[str, str, str]]:
 
 def is_ublox(port: str) -> bool:
     info = usb_info_for_tty(port)
-    return bool(info and info[0] == "1546")
+    return bool(info and info[0] == UBLOX_VID)
+
+
+def ubx_checksum(data: bytes) -> bytes:
+    a = b = 0
+    for x in data:
+        a = (a + x) & 0xFF
+        b = (b + a) & 0xFF
+    return bytes([a, b])
+
+
+def parse_ubx_mon_ver(buf: bytes) -> Optional[Tuple[str, str]]:
+    """Find a checksum-valid UBX-MON-VER reply in buf -> (swVersion, hwVersion), else None."""
+    i = 0
+    while True:
+        i = buf.find(b"\xb5\x62\x0a\x04", i)
+        if i < 0 or len(buf) < i + 6:
+            return None
+        length = buf[i + 4] | (buf[i + 5] << 8)
+        end = i + 6 + length + 2
+        if length >= 40 and len(buf) >= end and ubx_checksum(buf[i + 2:i + 6 + length]) == buf[i + 6 + length:end]:
+            payload = buf[i + 6:i + 6 + length]
+            sw = payload[0:30].split(b"\0")[0].decode("ascii", "replace")
+            hw = payload[30:40].split(b"\0")[0].decode("ascii", "replace")
+            return sw, hw
+        i += 2
+
+
+def ublox_handshake(ser, stop_evt: threading.Event, timeout: float = 3.0) -> Optional[Tuple[str, str]]:
+    """Ask the receiver for UBX-MON-VER (a read-only query). Only a u-blox answers with a valid frame."""
+    buf = b""
+    end = time.monotonic() + timeout
+    next_poll = 0.0
+    while time.monotonic() < end and not stop_evt.is_set():
+        if time.monotonic() >= next_poll:
+            ser.write(UBX_POLL_MON_VER)
+            ser.flush()
+            next_poll = time.monotonic() + 1.0
+        chunk = ser.read(512)
+        if chunk:
+            buf = (buf + chunk)[-4096:]
+            res = parse_ubx_mon_ver(buf)
+            if res:
+                return res
+    return None
 
 
 def find_dump1090(explicit: Optional[str] = None) -> Optional[str]:
-    candidates = [explicit, os.environ.get("AEROS_DUMP1090"),
-                  "/usr/local/bin/dump1090-aeros",
-                  os.path.expanduser("~/.local/share/aeros/bin/dump1090")]
-    for c in candidates:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
-    for name in BINARY_NAMES:
-        p = shutil.which(name)
-        if p:
-            return p
-    return None
+    return Dump1090Controller.find_binary(explicit)
 
 
 def _priv(cmd: List[str]) -> List[str]:
@@ -344,6 +356,14 @@ def build_dump1090() -> Optional[str]:
     return None
 
 
+def install_pymodes() -> bool:
+    """pyModeS must stay on the 2.x API (3.x removed it). Retries with --break-system-packages on PEP 668 distros."""
+    cmd = [sys.executable, "-m", "pip", "install", "--user", "pyModeS>=2.13,<3"]
+    if _run(cmd).returncode == 0:
+        return True
+    return _run(cmd + ["--break-system-packages"]).returncode == 0
+
+
 def setup_system(args: argparse.Namespace) -> int:
     """Detect the distro, install dependencies, configure udev/gpsd, build dump1090."""
     d = detect_distro()
@@ -361,6 +381,11 @@ def setup_system(args: argparse.Namespace) -> int:
     missing = _apt_install(APT_PACKAGES)
     if missing:
         say(f"{RED}could not install: {', '.join(missing)}{RESET} (continuing)")
+
+    if HAVE_PYMODES:
+        say("pyModeS (v2 API) already available")
+    elif not install_pymodes():
+        say(f"{RED}pyModeS install failed: AERØS will use the decoder's own JSON/SBS output instead{RESET}")
 
     # 2. RTL-SDR access: keep the DVB-T kernel driver off the dongle, grant USB access
     _sudo_write("/etc/modprobe.d/aeros-rtlsdr-blacklist.conf",
@@ -493,6 +518,8 @@ class GpsSupervisor(threading.Thread):
         self._updated = 0.0
         self._sv: Dict[str, int] = {}
         self._note = ""
+        self._rejected: Dict[str, str] = {}   # serial ports that failed the u-blox check (sticky)
+        self._gdev: Dict[str, dict] = {}      # gpsd devices seen this session
 
     # -- state ---------------------------------------------------------------
     def _update(self, **kw) -> None:
@@ -518,7 +545,7 @@ class GpsSupervisor(threading.Thread):
         if a.fixed_pos:
             lat, lon, alt = a.fixed_pos
             while True:
-                self._update(source="fixed", status="FIXED POSITION", lat=lat, lon=lon, alt=alt,
+                self._update(source="fixed", status="FIXED", lat=lat, lon=lon, alt=alt,
                              mode=3, static=True, eph=5.0)
                 if self.stop_evt.wait(1.0):
                     return
@@ -535,7 +562,10 @@ class GpsSupervisor(threading.Thread):
                     found = self._autodetect_serial()
                     port, baud = found if found else (None, None)
                 if port:
-                    self._serial_session(port, baud)
+                    if port in self._rejected:
+                        self._status("REJECTED", self._rejected[port])
+                    else:
+                        self._serial_session(port, baud)
                     connected = True
             if not connected:
                 self._status("NO DEVICE", self._note or "no GPS found (gpsd / serial)")
@@ -552,6 +582,7 @@ class GpsSupervisor(threading.Thread):
             return False
         got_data = False
         start = time.monotonic()
+        self._gdev = {}
         with sock:
             sock.settimeout(1.0)
             try:
@@ -578,15 +609,61 @@ class GpsSupervisor(threading.Thread):
                         got_data = True
         return got_data
 
+    def _gpsd_note_device(self, d: dict) -> None:
+        path = d.get("path")
+        if not path:
+            return
+        rec = self._gdev.setdefault(path, {"first": time.monotonic(), "driver": ""})
+        if d.get("driver"):
+            rec["driver"] = str(d["driver"])
+
+    def _gpsd_verdict(self, path: Optional[str]) -> Optional[bool]:
+        """True = u-blox confirmed, False = rejected, None = still identifying."""
+        if path is None and len(self._gdev) == 1:
+            path = next(iter(self._gdev))
+        rec = self._gdev.get(path) if path else None
+        if rec is None:
+            return None
+        if "u-blox" in rec["driver"].lower() or is_ublox(path):
+            return True
+        if time.monotonic() - rec["first"] > GPSD_IDENT_GRACE:
+            return False
+        return None
+
+    def _gpsd_gate(self, msg: dict) -> bool:
+        """Only data from a gpsd device that is a u-blox receiver may reach the fix state."""
+        verdict = self._gpsd_verdict(msg.get("device"))
+        if verdict is True:
+            return True
+        path = msg.get("device") or (next(iter(self._gdev)) if len(self._gdev) == 1 else "?")
+        if verdict is False:
+            drv = self._gdev.get(path, {}).get("driver") or "unknown"
+            self._status("REJECTED", f"gpsd device {path} is '{drv}', not a u-blox receiver (unsupported)")
+        else:
+            self._status("IDENTIFYING", "waiting for gpsd to identify a u-blox receiver")
+        return False
+
     def _handle_gpsd(self, raw: bytes, name: str) -> bool:
         try:
             msg = json.loads(raw.decode("utf-8", "replace"))
         except ValueError:
             return False
         cls = msg.get("class")
+        if cls == "DEVICES":
+            devices = msg.get("devices") or []
+            for d in devices:
+                if isinstance(d, dict):
+                    self._gpsd_note_device(d)
+            return bool(devices)
+        if cls == "DEVICE":
+            self._gpsd_note_device(msg)
+            return True
         if cls == "TPV":
+            if not self._gpsd_gate(msg):
+                return True
             mode = int(msg.get("mode", 0) or 0)
-            kw = {"mode": mode, "status": GPS_STATUS.get(mode, "NO FIX"), "error": "", "source": name}
+            kw = {"mode": mode, "status": GPS_STATUS.get(mode, "NO FIX"), "error": "",
+                  "source": f"{name} (u-blox)"}
             for key, dest in (("lat", "lat"), ("lon", "lon"), ("speed", "speed_ms"),
                               ("track", "track"), ("eph", "eph")):
                 v = msg.get(key)
@@ -602,6 +679,8 @@ class GpsSupervisor(threading.Thread):
             self._update(**kw)
             return True
         if cls == "SKY":
+            if not self._gpsd_gate(msg):
+                return False
             kw = {}
             sats = msg.get("satellites")
             if isinstance(sats, list):
@@ -616,21 +695,9 @@ class GpsSupervisor(threading.Thread):
             if kw:
                 self._update(**kw)
             return False
-        if cls == "DEVICES":
-            return bool(msg.get("devices"))
         return False
 
     # -- serial NMEA ---------------------------------------------------------
-    def _serial_candidates(self) -> List[str]:
-        ports = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
-        real = {os.path.realpath(p) for p in ports}
-        for extra in ("/dev/serial0", "/dev/ttyAMA0"):  # Raspberry Pi GPIO UART
-            if os.path.exists(extra) and os.path.realpath(extra) not in real:
-                ports.append(extra)
-                real.add(os.path.realpath(extra))
-        ports.sort(key=lambda p: 0 if is_ublox(p) else 1)  # probe u-blox receivers first
-        return ports
-
     @staticmethod
     def _open_serial(port: str, baud: int, timeout: float):
         """Open the port exclusively when pyserial supports it, so we never split bytes with gpsd."""
@@ -639,34 +706,20 @@ class GpsSupervisor(threading.Thread):
         except TypeError:  # pyserial < 3.3
             return serial.Serial(port, baud, timeout=timeout)
 
-    def _probe_nmea(self, port: str, baud: int, dwell: float = 2.5) -> bool:
-        try:
-            with self._open_serial(port, baud, 0.5) as ser:
-                end = time.monotonic() + dwell
-                while time.monotonic() < end and not self.stop_evt.is_set():
-                    line = ser.readline().decode("ascii", "ignore").strip()
-                    if line and nmea_valid(line):
-                        return True
-        except (OSError, ValueError, getattr(serial, "SerialException", OSError)):
-            return False
-        return False
-
     def _autodetect_serial(self) -> Optional[Tuple[str, int]]:
+        """Auto mode only ever considers USB devices with the u-blox vendor ID (1546).
+        Every other port is left alone: it is neither opened nor written to."""
         if serial is None:
             self._note = "pyserial missing (apt install python3-serial) — serial GPS unavailable"
             return None
-        ports = self._serial_candidates()
-        if not ports:
-            self._note = "no gpsd and no /dev/ttyUSB*, /dev/ttyACM*, /dev/serial0 found"
-            return None
-        self._status("SCANNING", f"probing {len(ports)} serial port(s) for NMEA")
-        for baud in (9600, 115200, 38400, 57600, 4800):
-            for port in ports:
-                if self.stop_evt.is_set():
-                    return None
-                if self._probe_nmea(port, baud):
-                    return port, baud
-        self._note = "serial ports present but none speaks NMEA (try --gps-serial PORT --gps-baud N)"
+        ports = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+        good = [p for p in ports if is_ublox(p)]
+        if good:
+            return good[0], self.args.gps_baud  # baud is irrelevant over USB
+        ignored = len(ports)
+        self._note = ("no u-blox USB GPS found (vendor 1546)"
+                      + (f"; ignored {ignored} non-u-blox serial port(s)" if ignored else "")
+                      + ". Only u-blox modules are supported; UART modules need --gps-serial")
         return None
 
     def _serial_session(self, port: str, baud: int) -> None:
@@ -674,10 +727,28 @@ class GpsSupervisor(threading.Thread):
             self._note = "pyserial missing (apt install python3-serial)"
             return
         info = usb_info_for_tty(port)
-        name = f"serial {port}@{baud}" + (f" ({info[2]})" if info else "")
+        usb_ublox = bool(info and info[0] == UBLOX_VID)
         try:
-            with self._open_serial(port, baud, 1) as ser:
+            with self._open_serial(port, baud, 0.5) as ser:
+                if usb_ublox:
+                    ident = info[2]
+                else:
+                    # Not a u-blox USB device (UART, USB-serial bridge, unknown): prove it is a u-blox
+                    # with one read-only UBX-MON-VER poll before a single byte of NMEA is trusted.
+                    self._status("IDENTIFYING", f"verifying {port} is a u-blox (UBX-MON-VER)")
+                    res = ublox_handshake(ser, self.stop_evt)
+                    if res is None:
+                        if self.stop_evt.is_set():
+                            return
+                        msg = (f"{port} did not answer UBX-MON-VER: not a u-blox receiver, or its RX pin "
+                               f"is not wired. Unsupported")
+                        self._rejected[port] = msg
+                        self._status("REJECTED", msg)
+                        return
+                    ident = f"u-blox sw {res[0]} hw {res[1]}"
+                name = f"serial {port}@{baud} ({ident})"
                 self._update(source=name, status="NO FIX", error="")
+                ser.timeout = 1
                 last_ok = time.monotonic()
                 while not self.stop_evt.is_set():
                     raw = ser.readline()
@@ -739,290 +810,72 @@ class GpsSupervisor(threading.Thread):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Aircraft model + sources
+# Shared stats + decoder supervision (process control itself lives in airplanes.py)
 # ─────────────────────────────────────────────────────────────────────────────
-@dataclasses.dataclass
-class Aircraft:
-    icao: str
-    callsign: str = ""
-    squawk: str = ""
-    alt_ft: Optional[float] = None
-    on_ground: bool = False
-    speed_kt: Optional[float] = None
-    track: Optional[float] = None
-    lat: Optional[float] = None
-    lon: Optional[float] = None
-    rssi: Optional[float] = None
-    messages: int = 0
-    first_seen: float = 0.0
-    last_seen: float = 0.0
-    fresh: bool = False
-
-
-class AircraftTable:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._ac: Dict[str, Aircraft] = {}
-        self.unique = 0
-
-    def upsert(self, icao: str, seen_at: float, fresh: bool, **fields) -> None:
-        with self._lock:
-            ac = self._ac.get(icao)
-            if ac is None:
-                ac = Aircraft(icao=icao, first_seen=seen_at)
-                self._ac[icao] = ac
-                self.unique += 1
-            for k, v in fields.items():
-                if v is None or (k in ("callsign", "squawk") and not v):
-                    continue
-                setattr(ac, k, v)
-            if seen_at > ac.last_seen:
-                ac.last_seen = seen_at
-            if fresh:
-                ac.fresh = True
-
-    def drain_fresh(self) -> List[Aircraft]:
-        with self._lock:
-            out = [dataclasses.replace(a) for a in self._ac.values() if a.fresh]
-            for a in self._ac.values():
-                a.fresh = False
-        return out
-
-    def snapshot(self, max_age: float) -> List[Aircraft]:
-        now = time.time()
-        with self._lock:
-            for k in [k for k, a in self._ac.items() if now - a.last_seen > max(max_age * 5, 300)]:
-                del self._ac[k]
-            return [dataclasses.replace(a) for a in self._ac.values() if now - a.last_seen <= max_age]
-
-
 class Stats:
     def __init__(self) -> None:
         self.sdr_state = "INIT"
         self.sdr_detail = ""
         self.feed_kind = "-"
         self.feed_ok = False
+        self.rssi_ok = False
         self.msgs_total = 0
         self.msgs_rate = 0.0
         self.log_rows = 0
         self.logging_note = ""
 
 
-class JsonSource(threading.Thread):
-    """Polls the decoder's aircraft.json (dump1090-fa / readsb / mutability)."""
-
-    def __init__(self, directory: str, table: AircraftTable, stats: Stats, stop: threading.Event):
-        super().__init__(daemon=True, name="json-feed")
-        self.path = os.path.join(directory, "aircraft.json")
-        self.table, self.stats, self.stop_evt = table, stats, stop
-        self.halt = threading.Event()
-        self._last_msgs: Dict[str, int] = {}
-
-    def run(self) -> None:
-        self.stats.feed_kind = "json"
-        while not (self.stop_evt.is_set() or self.halt.is_set()):
-            data = None
-            try:
-                age = time.time() - os.stat(self.path).st_mtime
-                with open(self.path, "rb") as fh:
-                    data = json.loads(fh.read().decode("utf-8", "replace"))
-                self.stats.feed_ok = age < 10
-            except (OSError, ValueError):
-                self.stats.feed_ok = False
-            if isinstance(data, dict):
-                self._ingest(data)
-            self.stop_evt.wait(1.0)
-
-    def _ingest(self, data: dict) -> None:
-        now = time.time()
-        total = data.get("messages")
-        if isinstance(total, int):
-            self.stats.msgs_total = total
-        seen_ids = set()
-        for a in data.get("aircraft", []):
-            icao = str(a.get("hex", "")).strip().upper()
-            if not HEX6.fullmatch(icao):  # skips '~' non-ICAO (TIS-B) addresses
-                continue
-            seen_ids.add(icao)
-            msgs = int(a.get("messages", 0) or 0)
-            seen = to_float(a.get("seen")) or 0.0
-            prev = self._last_msgs.get(icao)
-            fresh = (seen < 2.0) if prev is None else (msgs > prev)
-            self._last_msgs[icao] = msgs
-            alt_raw = a.get("alt_baro", a.get("altitude", a.get("alt_geom")))
-            on_ground = isinstance(alt_raw, str) and alt_raw.lower() == "ground"
-            alt = None if on_ground else to_float(alt_raw)
-            self.table.upsert(
-                icao, now - seen, fresh,
-                callsign=str(a.get("flight") or "").strip(),
-                squawk=str(a.get("squawk") or ""),
-                alt_ft=alt, on_ground=on_ground,
-                speed_kt=to_float(a.get("gs", a.get("speed"))),
-                track=to_float(a.get("track")),
-                lat=to_float(a.get("lat")), lon=to_float(a.get("lon")),
-                rssi=to_float(a.get("rssi")), messages=msgs,
-            )
-        for k in [k for k in self._last_msgs if k not in seen_ids]:
-            del self._last_msgs[k]
-
-
-class SbsSource(threading.Thread):
-    """Reads the BaseStation/SBS-1 CSV feed on TCP (usually :30003). No RSSI available."""
-
-    def __init__(self, host: str, port: int, table: AircraftTable, stats: Stats, stop: threading.Event):
-        super().__init__(daemon=True, name="sbs-feed")
-        self.host, self.port = host, port
-        self.table, self.stats, self.stop_evt = table, stats, stop
-        self.halt = threading.Event()
-
-    def run(self) -> None:
-        self.stats.feed_kind = "sbs"
-        while not (self.stop_evt.is_set() or self.halt.is_set()):
-            try:
-                with socket.create_connection((self.host, self.port), timeout=5) as s:
-                    s.settimeout(2.0)
-                    self.stats.feed_ok = True
-                    buf = b""
-                    while not (self.stop_evt.is_set() or self.halt.is_set()):
-                        try:
-                            data = s.recv(8192)
-                        except socket.timeout:
-                            continue
-                        if not data:
-                            break
-                        buf += data
-                        *lines, buf = buf.split(b"\n")
-                        for ln in lines:
-                            self._line(ln.decode("ascii", "ignore").strip())
-            except OSError:
-                pass
-            self.stats.feed_ok = False
-            self.stop_evt.wait(2.0)
-
-    def _line(self, line: str) -> None:
-        f = line.split(",")
-        if len(f) < 11 or f[0] != "MSG":
-            return
-        icao = f[4].strip().upper()
-        if not HEX6.fullmatch(icao):
-            return
-        self.stats.msgs_total += 1
-
-        def col(i: int) -> Optional[float]:
-            return to_float(f[i]) if len(f) > i else None
-
-        ground = len(f) > 21 and f[21].strip() == "-1"
-        self.table.upsert(
-            icao, time.time(), True,
-            callsign=f[10].strip(), squawk=f[17].strip() if len(f) > 17 else "",
-            alt_ft=col(11), on_ground=ground, speed_kt=col(12), track=col(13),
-            lat=col(14), lon=col(15),
-        )
-
-
-def explain_sdr_error(text: str) -> str:
-    t = text.lower()
-    if "kernel driver is active" in t or "usb_claim_interface" in t or "resource busy" in t:
-        return "dongle busy: DVB driver loaded or another SDR app running (run --setup, then replug)"
-    if "no supported" in t or "no rtl" in t or "no device" in t:
-        return "no RTL-SDR dongle found: check USB connection / power / antenna"
-    if "permission" in t or "usb_open error -3" in t:
-        return "USB permission denied: add user to plugdev (run --setup, re-login) or use sudo"
-    last = [ln for ln in text.splitlines() if ln.strip()]
-    return (last[-1][:110] if last else "decoder exited immediately")
+def extra_decoder_args(args: argparse.Namespace) -> List[str]:
+    extra: List[str] = []
+    if args.gain is not None:
+        extra += ["--gain", str(args.gain)]
+    if args.device_index is not None:
+        extra += ["--device-index", str(args.device_index)]
+    if args.dump1090_args:
+        extra += shlex.split(args.dump1090_args)
+    return extra
 
 
 class SdrSupervisor(threading.Thread):
-    """Starts dump1090 (trying flag sets until one works), watches it, restarts on failure."""
+    """Keeps the decoder up: starts it (or adopts one already serving :30002), restarts it if it dies."""
 
-    def __init__(self, binary: str, args: argparse.Namespace, json_dir: str,
-                 stats: Stats, stop: threading.Event, on_started):
+    def __init__(self, ctl: Dump1090Controller, stats: Stats, stop: threading.Event, on_started):
         super().__init__(daemon=True, name="sdr")
-        self.binary, self.args, self.json_dir = binary, args, json_dir
-        self.stats, self.stop_evt, self.on_started = stats, stop, on_started
-        self.proc: Optional[subprocess.Popen] = None
-        self.tail: collections.deque = collections.deque(maxlen=40)
-
-    def _variants(self):
-        extra: List[str] = []
-        if self.args.gain is not None:
-            extra += ["--gain", str(self.args.gain)]
-        if self.args.device_index is not None:
-            extra += ["--device-index", str(self.args.device_index)]
-        if self.args.dump1090_args:
-            extra += shlex.split(self.args.dump1090_args)
-        for mode, tmpl in LADDERS:
-            yield mode, [self.binary] + [x.replace("{json}", self.json_dir) for x in tmpl] + extra
-
-    def _drain(self, proc: subprocess.Popen) -> None:
-        try:
-            for line in proc.stderr:  # type: ignore[union-attr]
-                line = line.strip()
-                if line:
-                    self.tail.append(line)
-        except (ValueError, OSError):
-            pass
-
-    def _try_start(self) -> Tuple[Optional[subprocess.Popen], str, str]:
-        last_err = ""
-        for mode, argv in self._variants():
-            self.tail.clear()
-            try:
-                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.PIPE, start_new_session=True,
-                                        text=True, errors="replace")
-            except OSError as exc:
-                return None, "", f"cannot execute {self.binary}: {exc}"
-            reader = threading.Thread(target=self._drain, args=(proc,), daemon=True)
-            reader.start()
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline and proc.poll() is None and not self.stop_evt.is_set():
-                time.sleep(0.2)
-            if proc.poll() is None:
-                return proc, mode, ""
-            reader.join(timeout=1.0)
-            err = "\n".join(self.tail)
-            last_err = err or f"exit code {proc.returncode}"
-            if HW_ERR.search(err):  # hardware problem — other flag sets won't help
-                return None, "", last_err
-        return None, "", last_err
+        self.ctl, self.stats, self.stop_evt, self.on_started = ctl, stats, stop, on_started
 
     def run(self) -> None:
-        name = os.path.basename(self.binary)
+        ctl = self.ctl
+        name = os.path.basename(ctl.binary or "dump1090")
         while not self.stop_evt.is_set():
             self.stats.sdr_state, self.stats.sdr_detail = "STARTING", name
-            proc, mode, err = self._try_start()
-            if proc is None:
+            if not ctl.ensure_running():
                 if self.stop_evt.is_set():
                     break
                 self.stats.sdr_state = "ERROR"
-                self.stats.sdr_detail = explain_sdr_error(err)
+                self.stats.sdr_detail = explain_sdr_error(ctl.last_error)
                 self.stats.feed_ok = False
                 self.stop_evt.wait(10.0)
                 continue
-            self.proc = proc
-            self.stats.sdr_state, self.stats.sdr_detail = "RUNNING", f"{name} [{mode}]"
-            self.on_started(mode)
-            while not self.stop_evt.is_set() and proc.poll() is None:
+            external = ctl.process is None
+            if external:
+                self.stats.sdr_state = "EXTERNAL"
+                self.stats.sdr_detail = f"existing decoder on :{ctl.raw_port} [raw]"
+            else:
+                self.stats.sdr_state, self.stats.sdr_detail = "RUNNING", f"{name} [{ctl.mode}]"
+            self.on_started(ctl.mode, external)
+            while not self.stop_evt.is_set() and (ctl.is_port_open() if external else ctl.alive()):
                 self.stop_evt.wait(1.0)
             if self.stop_evt.is_set():
                 break
+            code = "" if external else f" ({ctl.process.returncode})" if ctl.process else ""
             self.stats.sdr_state = "STOPPED"
-            self.stats.sdr_detail = f"{name} exited ({proc.returncode}); restarting"
+            self.stats.sdr_detail = f"{name} exited{code}; restarting"
+            ctl.shutdown()
             self.stop_evt.wait(5.0)
         self.terminate()
 
     def terminate(self) -> None:
-        proc = self.proc
-        if proc and proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=3)
-            except (subprocess.TimeoutExpired, OSError):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+        self.ctl.shutdown()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1187,28 +1040,33 @@ class WardriveEngine(threading.Thread):
             if len(self._last) > 5000:
                 self._last = {k: v for k, v in self._last.items() if now - v[0] < 600}
 
-    def _maybe_log(self, ac: Aircraft, fix: GpsFix, now: float) -> None:
+    def _maybe_log(self, ac, fix: GpsFix, now: float) -> None:
         last = self._last.get(ac.icao)
         if last is not None:
             moved_m = haversine_km(last[1], last[2], fix.lat, fix.lon) * 1000.0
             if now - last[0] < self.interval and moved_m < self.move_m:
                 return
         dist = None
-        if ac.lat is not None and ac.lon is not None:
-            dist = haversine_km(fix.lat, fix.lon, ac.lat, ac.lon)
+        d_nm, _ = ac.distance_bearing_from(fix.lat, fix.lon)
+        if d_nm is not None:
+            dist = d_nm * 1.852
         self.logger.add(Sighting(
             utc=fix.utc_now(), rx_lat=fix.lat, rx_lon=fix.lon, rx_alt=fix.alt, rx_acc=fix.accuracy_m(),
-            sats=fix.sats_used, icao=ac.icao, callsign=ac.callsign, squawk=ac.squawk, alt_ft=ac.alt_ft,
-            speed_kt=ac.speed_kt, track=ac.track, ac_lat=ac.lat, ac_lon=ac.lon, rssi=ac.rssi, dist_km=dist,
+            sats=fix.sats_used, icao=ac.icao, callsign=ac.callsign, squawk=ac.squawk, alt_ft=ac.altitude_ft,
+            speed_kt=ac.speed_kt, track=ac.heading_deg, ac_lat=ac.lat, ac_lon=ac.lon, rssi=ac.rssi, dist_km=dist,
         ))
         self._last[ac.icao] = (now, fix.lat, fix.lon)
         self.stats.log_rows = self.logger.rows
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Application / terminal UI
+# Application / curses terminal UI
 # ─────────────────────────────────────────────────────────────────────────────
 ROW_FMT = "{:<6}  {:<8}  {:>9}  {:>7}  {:>7}  {:>4}  {:>7}  {:>5}"
+TABLE_WIDTH = 67
+RANGE_STEPS_KM = [10, 25, 50, 100, 200, 300, 450]
+ARROWS = ["↑", "↗", "→", "↘", "↓", "↙", "←", "↖"]
+ARROWS_ASCII = ["^", "/", ">", "\\", "v", "/", "<", "\\"]
 
 
 class App:
@@ -1220,82 +1078,60 @@ class App:
         self.gps = GpsSupervisor(args, self.stop)
         self.logger: Optional[WardriveLogger] = None
         self.sdr: Optional[SdrSupervisor] = None
-        self.source = None
+        self.ctl: Optional[Dump1090Controller] = None
+        self.sources: List = []
         self.source_mode = ""
         self.json_dir = ""
         self._src_lock = threading.Lock()
         self.banner = banner_lines(args.ascii)
         self.sep = "-" if args.ascii else "─"
         self.dot = "|" if args.ascii else "·"
+        self.ring = "." if args.ascii else "·"
+        self.arrows = ARROWS_ASCII if args.ascii else ARROWS
+        self.view = "auto"            # auto | table | radar
+        self.range_km: Optional[float] = None  # None = auto-range
+        self.A_PURPLE = 0
+        self.A_CYAN = 0
 
     # -- data source management ---------------------------------------------
-    def _start_source(self, mode: str, directory: str = "") -> None:
+    def _rssi_dir(self, external: bool) -> str:
+        if not external:
+            return self.json_dir
+        if self.args.json_dir:
+            return self.args.json_dir
+        return next((d for d in COMMON_JSON_DIRS if os.path.exists(os.path.join(d, "aircraft.json"))), "")
+
+    def _start_sources(self, mode: str, external: bool = False) -> None:
+        a = self.args
         with self._src_lock:
-            if self.source is not None and self.source_mode == mode:
+            if self.sources and self.source_mode == mode:
                 return
-            if self.source is not None:
-                self.source.halt.set()
-            if mode == "json":
-                self.source = JsonSource(directory or self.json_dir, self.table, self.stats, self.stop)
+            for src in self.sources:
+                src.halt.set()
+            self.sources = []
+            if mode == "raw":
+                self.sources.append(AircraftTracker(a.raw_host, a.raw_port, self.table, self.stats, self.stop))
+                rssi_dir = self._rssi_dir(external)
+                if rssi_dir:
+                    self.sources.append(RssiSource(rssi_dir, self.table, self.stats, self.stop))
+            elif mode == "json":
+                self.sources.append(JsonSource(self._rssi_dir(external) or self.json_dir, self.table, self.stats, self.stop))
             else:
-                self.source = SbsSource(self.args.sbs_host, self.args.sbs_port, self.table, self.stats, self.stop)
+                self.sources.append(SbsSource(a.sbs_host, a.sbs_port, self.table, self.stats, self.stop))
             self.source_mode = mode
-            self.source.start()
+            for src in self.sources:
+                src.start()
 
-    # -- UI ------------------------------------------------------------------
-    def render(self) -> str:
-        cols, rows = shutil.get_terminal_size((100, 32))
-        cols = max(cols, 40)
+    # -- per-frame data ------------------------------------------------------
+    def _collect(self):
         fix = self.gps.snapshot()
-        st = self.stats
-        now = time.time()
-        out: List[str] = []
-
-        def add(text: str, color: str = CYAN) -> None:
-            out.append(color + clip(text, cols - 1) + RESET)
-
-        # persistent header (always pinned: whole frame is redrawn from the top)
-        if rows >= 24:
-            for line in self.banner:
-                add("  " + line, PURPLE)
-            add(f"  {SUBTITLE}  {self.dot}  v{VERSION}", PURPLE)
-            add(f"  {GITHUB}  {self.dot}  {HANDLE}", PURPLE)
-        else:
-            add(f" {APP_NAME} {self.dot} {SUBTITLE} {self.dot} {GITHUB} {self.dot} {HANDLE}", PURPLE)
-        add(self.sep * (cols - 1), PURPLE)
-
-        # receiver status
-        bad = st.sdr_state in ("ERROR", "STOPPED")
-        add(f" SDR  {st.sdr_state:<9} {st.sdr_detail}", RED if bad else CYAN)
-        feed = f"feed {st.feed_kind} {'OK' if st.feed_ok else '--'}   msgs {st.msgs_total}   {st.msgs_rate:.0f}/s"
-        add(f"      {feed}")
-        sats = "-" if fix.sats_used is None else str(fix.sats_used)
-        seen = "-" if fix.sats_seen is None else str(fix.sats_seen)
-        hdop = "-" if fix.hdop is None else f"{fix.hdop:.1f}"
-        gps_bad = fix.status in ("NO DEVICE", "NO DATA", "DISABLED")
-        add(f" GPS  {fix.status:<9} sats {sats}/{seen}  hdop {hdop}  {fix.source if fix.source != 'none' else ''}"
-            + (f"  [{fix.error}]" if fix.error else ""), RED if gps_bad else CYAN)
-        if fix.lat is not None and fix.lon is not None and fix.mode >= 2:
-            alt = "-" if fix.alt is None else f"{fix.alt:.0f} m"
-            utc = time.strftime("%H:%M:%S", time.gmtime(fix.utc_now()))
-            add(f" POS  {fix.lat:.6f}, {fix.lon:.6f}  alt {alt}  UTC {utc}")
-        else:
-            add(" POS  no position yet")
-        live = self.table.snapshot(self.args.max_age)
-        name = os.path.basename(self.logger.base) if self.logger else "-"
-        note = f"  [{st.logging_note}]" if st.logging_note else ""
-        add(f" LOG  {name}  rows {st.log_rows}  aircraft now {len(live)} / total {self.table.unique}{note}")
-        add(self.sep * (cols - 1), PURPLE)
-
-        # aircraft table
-        u = self.args.units
-        add(ROW_FMT.format("ICAO", "CALLSIGN", f"DIST({u})", "ALT(ft)", "SPD(kt)", "HDG", "RSSI", "SEEN"))
         entries = []
-        for ac in live:
-            dist = None
-            if fix.has_fix and ac.lat is not None and ac.lon is not None:
-                dist = haversine_km(fix.lat, fix.lon, ac.lat, ac.lon)
-            entries.append((ac, dist))
+        for ac in self.table.snapshot(self.args.max_age):
+            dist_km = brg = None
+            if fix.has_fix:
+                d_nm, brg = ac.distance_bearing_from(fix.lat, fix.lon)
+                dist_km = None if d_nm is None else d_nm * 1.852
+            entries.append((ac, dist_km, brg))
         key = self.args.sort
         if key == "dist":
             entries.sort(key=lambda e: (e[1] is None, e[1] or 0.0))
@@ -1303,57 +1139,212 @@ class App:
             entries.sort(key=lambda e: (e[0].rssi is None, -(e[0].rssi or 0.0)))
         else:
             entries.sort(key=lambda e: -e[0].last_seen)
-        room = max(0, rows - len(out) - 1)  # keep one line for the footer
-        shown = entries[:room]
-        if len(entries) > room and room > 0:
-            shown = entries[:room - 1]
-        for ac, dist in shown:
+        return fix, entries
+
+    # -- curses drawing ------------------------------------------------------
+    def _init_colors(self, scr) -> None:
+        curses.start_color()
+        if curses.COLORS >= 16:
+            purple, cyan, extra = 13, 14, 0      # bright magenta / bright cyan == \033[95m / \033[96m
+        else:
+            purple, cyan, extra = curses.COLOR_MAGENTA, curses.COLOR_CYAN, curses.A_BOLD
+        curses.init_pair(1, purple, curses.COLOR_BLACK)
+        curses.init_pair(2, cyan, curses.COLOR_BLACK)
+        self.A_PURPLE = curses.color_pair(1) | extra
+        self.A_CYAN = curses.color_pair(2) | extra
+        scr.bkgd(" ", self.A_CYAN)             # black background everywhere
+
+    @staticmethod
+    def _put(scr, y: int, x: int, text: str, attr: int) -> None:
+        rows, cols = scr.getmaxyx()
+        if y < 0 or y >= rows or x < 0 or x >= cols - 1 or not text:
+            return
+        try:
+            scr.addnstr(y, x, text, cols - x - 1, attr)
+        except curses.error:
+            pass
+
+    def _effective_range(self, entries) -> Tuple[float, bool]:
+        if self.range_km:
+            return self.range_km, False
+        far = max((d for _, d, _ in entries if d is not None), default=0.0)
+        for step in RANGE_STEPS_KM:
+            if far * 1.1 <= step:
+                return float(step), True
+        return float(RANGE_STEPS_KM[-1]), True
+
+    def _step_range(self, entries, direction: int) -> None:
+        cur, _ = self._effective_range(entries)
+        steps = RANGE_STEPS_KM
+        idx = min(range(len(steps)), key=lambda i: abs(steps[i] - cur))
+        self.range_km = float(steps[max(0, min(len(steps) - 1, idx + direction))])
+
+    def _draw(self, scr, entries_out: list) -> None:
+        scr.erase()
+        rows, cols = scr.getmaxyx()
+        fix, entries = self._collect()
+        entries_out[:] = entries
+        st, a = self.stats, self.args
+        P, C = self.A_PURPLE, self.A_CYAN
+        ALERT = C | curses.A_REVERSE | curses.A_BOLD
+        now = time.time()
+
+        # ── pinned header (purple) — redrawn from row 0 on every frame
+        y = 0
+        if rows >= 24 and cols >= 44:
+            for line in self.banner:
+                self._put(scr, y, 2, line, P)
+                y += 1
+            self._put(scr, y, 2, f"{SUBTITLE}  {self.dot}  v{VERSION}", P)
+            self._put(scr, y + 1, 2, f"{GITHUB}  {self.dot}  {HANDLE}", P)
+            y += 2
+        else:
+            self._put(scr, y, 1, f"{APP_NAME} {self.dot} {SUBTITLE} {self.dot} {GITHUB} {self.dot} {HANDLE}", P)
+            y += 1
+        self._put(scr, y, 0, self.sep * (cols - 1), P)
+        y += 1
+
+        # ── status block (cyan)
+        rssi_src = "json" if (st.rssi_ok or st.feed_kind == "json") else "n/a"
+        bad = st.sdr_state in ("ERROR", "STOPPED")
+        self._put(scr, y, 1, "SDR  ", C)
+        self._put(scr, y, 6, f"{st.sdr_state:<12}", ALERT if bad else C)
+        self._put(scr, y, 19, f"{st.sdr_detail}   feed {st.feed_kind} {'OK' if st.feed_ok else '--'}   "
+                              f"msgs {st.msgs_total} ({st.msgs_rate:.0f}/s)   rssi {rssi_src}", C)
+        y += 1
+        sats = "-" if fix.sats_used is None else str(fix.sats_used)
+        seen = "-" if fix.sats_seen is None else str(fix.sats_seen)
+        hdop = "-" if fix.hdop is None else f"{fix.hdop:.1f}"
+        gps_bad = fix.status in ("NO DEVICE", "NO DATA", "DISABLED", "REJECTED", "DISCONNECTED")
+        self._put(scr, y, 1, "GPS  ", C)
+        self._put(scr, y, 6, f"{fix.status:<12}", ALERT if gps_bad else C)
+        self._put(scr, y, 19, f"sats {sats}/{seen}  hdop {hdop}  {fix.source if fix.source != 'none' else ''}"
+                              + (f"  [{fix.error}]" if fix.error else ""), C)
+        y += 1
+        if fix.lat is not None and fix.lon is not None and fix.mode >= 2:
+            alt = "-" if fix.alt is None else f"{fix.alt:.0f} m"
+            utc = time.strftime("%H:%M:%S", time.gmtime(fix.utc_now()))
+            self._put(scr, y, 1, f"POS  {fix.lat:.6f}, {fix.lon:.6f}  alt {alt}  UTC {utc}", C)
+        else:
+            self._put(scr, y, 1, "POS  no position yet", C)
+        y += 1
+        name = os.path.basename(self.logger.base) if self.logger else "-"
+        note = f"  [{st.logging_note}]" if st.logging_note else ""
+        self._put(scr, y, 1, f"LOG  {name}  rows {st.log_rows}  aircraft now {len(entries)} / total "
+                             f"{self.table.unique}{note}", C)
+        y += 1
+        self._put(scr, y, 0, self.sep * (cols - 1), C)
+        y += 1
+
+        # ── body: table and/or radar scope
+        body_h = rows - y - 1
+        both_ok = cols >= 104 and body_h >= 11
+        show_table, show_radar = {"table": (True, False), "radar": (False, True)}.get(self.view, (True, both_ok))
+        if show_table:
+            self._draw_table(scr, y, body_h, fix, entries, now)
+        if show_radar:
+            x0 = TABLE_WIDTH + 2 if show_table else 0
+            self._draw_radar(scr, y, x0, cols - 1 - x0, body_h, fix, entries, now)
+        footer = (f" [q] quit & save  [s] save KML  [v] view:{self.view}  [+/-] range  [a] auto range"
+                  f"   RSSI=dBFS")
+        self._put(scr, rows - 1, 0, footer, C)
+        scr.refresh()
+
+    def _draw_table(self, scr, y0: int, body_h: int, fix, entries, now: float) -> None:
+        C = self.A_CYAN
+        u = self.args.units
+        self._put(scr, y0, 0, ROW_FMT.format("ICAO", "CALLSIGN", f"DIST({u})", "ALT(ft)", "SPD(kt)",
+                                              "HDG", "RSSI", "SEEN"), C | curses.A_BOLD)
+        room = max(0, body_h - 1)
+        shown = entries[:room - 1] if len(entries) > room and room > 0 else entries[:room]
+        for i, (ac, dist, _) in enumerate(shown):
             d = "-" if dist is None else f"{dist * UNIT_FACTORS[u]:.1f}"
-            alt = "GND" if ac.on_ground else ("-" if ac.alt_ft is None else f"{ac.alt_ft:.0f}")
+            alt = "GND" if ac.on_ground else ("-" if ac.altitude_ft is None else f"{ac.altitude_ft:.0f}")
             spd = "-" if ac.speed_kt is None else f"{ac.speed_kt:.0f}"
-            hdg = "-" if ac.track is None else f"{ac.track:.0f}"
+            hdg = "-" if ac.heading_deg is None else f"{ac.heading_deg:.0f}"
             rssi = "n/a" if ac.rssi is None else f"{ac.rssi:.1f}"
             age = f"{max(0, now - ac.last_seen):.0f}s"
-            add(ROW_FMT.format(ac.icao, ac.callsign or "-", d, alt, spd, hdg, rssi, age))
-        if len(entries) > len(shown):
-            add(f"  ... +{len(entries) - len(shown)} more (enlarge the terminal)")
-        footer = f" [q] quit & save   [s] save KML now   RSSI = dBFS (relative)"
-        while len(out) < rows - 1:
-            out.append("")
-        add(footer, PURPLE)
-        return "\033[H" + "\n".join(line + "\033[K" for line in out[:rows]) + "\033[J"
+            self._put(scr, y0 + 1 + i, 0, ROW_FMT.format(ac.icao, ac.callsign or "-", d, alt, spd, hdg, rssi, age), C)
+        if len(entries) > len(shown) and room > 0:
+            self._put(scr, y0 + 1 + len(shown), 0, f"  ... +{len(entries) - len(shown)} more ([v] for full view)", C)
 
-    def _ui_loop(self) -> None:
-        fd = sys.stdin.fileno() if sys.stdin.isatty() else None
-        old = None
-        if fd is not None and termios is not None:
-            old = termios.tcgetattr(fd)
-            tty.setcbreak(fd)
-        sys.stdout.write("\033[?1049h\033[?25l\033[2J")
-        sys.stdout.flush()
-        next_save = time.monotonic() + self.args.save_interval
+    def _draw_radar(self, scr, y0: int, x0: int, w: int, h: int, fix, entries, now: float) -> None:
+        C = self.A_CYAN
+        u = self.args.units
+        rng, auto = self._effective_range(entries)
+        self._put(scr, y0, x0, f"RADAR  north-up  range {rng * UNIT_FACTORS[u]:.0f}{u}"
+                               f"{' (auto)' if auto else ''}", C | curses.A_BOLD)
+        sh = h - 2                      # scope rows (title above, legend below)
+        r_rows = (sh - 1) // 2
+        r_cols = min(2 * r_rows, (w - 1) // 2 - 1)   # terminal cells are ~2x taller than wide
+        if r_rows < 2 or r_cols < 6:
+            self._put(scr, y0 + 1, x0, "(terminal too small for the scope: enlarge it or press [v])", C)
+            return
+        cy, cx = y0 + 1 + r_rows, x0 + w // 2
+        n = max(60, int(3 * (r_rows + r_cols)))
+        for frac in (1 / 3, 2 / 3, 1.0):
+            for i in range(n):
+                th = 2 * math.pi * i / n
+                self._put(scr, cy - int(round(r_rows * frac * math.cos(th))),
+                          cx + int(round(r_cols * frac * math.sin(th))), self.ring, C | curses.A_DIM)
+        for label, dy, dx in (("N", -r_rows, 0), ("S", r_rows, 0), ("E", 0, r_cols), ("W", 0, -r_cols)):
+            self._put(scr, cy + dy, cx + dx, label, C | curses.A_BOLD)
+        sweep = math.radians((now * 90) % 360)   # rotating scope sweep
+        for k in range(1, 11):
+            f = k / 10.0
+            self._put(scr, cy - int(round(r_rows * f * math.cos(sweep))),
+                      cx + int(round(r_cols * f * math.sin(sweep))), self.ring, C)
+        self._put(scr, cy, cx, "+", C | curses.A_BOLD)
+        if not fix.has_fix:
+            self._put(scr, cy + 2, cx - 6, "NO GPS FIX", C | curses.A_REVERSE)
+            self._put(scr, cy + 3, cx - 6, "scope idle", C)
+            return
+        plotted = 0
+        for ac, dist, brg in entries:
+            if dist is None or brg is None or dist > rng:
+                continue
+            frac = dist / rng
+            th = math.radians(brg)
+            py = cy - int(round(r_rows * frac * math.cos(th)))
+            px = cx + int(round(r_cols * frac * math.sin(th)))
+            sym = "*" if ac.heading_deg is None else self.arrows[int(((ac.heading_deg + 22.5) % 360) // 45)]
+            self._put(scr, py, px, sym, C | curses.A_BOLD)
+            label = (ac.callsign or ac.icao)[:8]
+            if px + 2 + len(label) < x0 + w:
+                self._put(scr, py, px + 2, label, C)
+            plotted += 1
+        self._put(scr, y0 + h - 1, x0, f"{plotted} plotted, {len(entries)} heard   rings at "
+                                       f"{rng / 3 * UNIT_FACTORS[u]:.0f}/{rng * 2 / 3 * UNIT_FACTORS[u]:.0f}/"
+                                       f"{rng * UNIT_FACTORS[u]:.0f}{u}", C)
+
+    def _curses_main(self, scr) -> None:
         try:
-            while not self.stop.is_set():
-                sys.stdout.write(self.render())
-                sys.stdout.flush()
-                if old is not None:
-                    ready, _, _ = select.select([sys.stdin], [], [], 0.5)
-                    if ready:
-                        for ch in os.read(fd, 32).decode("utf-8", "ignore").lower():
-                            if ch == "q":
-                                self.stop.set()
-                            elif ch == "s":
-                                self._safe_save()
-                else:
-                    self.stop.wait(0.5)
-                if time.monotonic() >= next_save:
-                    self._safe_save()
-                    next_save = time.monotonic() + self.args.save_interval
-        finally:
-            if old is not None:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            sys.stdout.write("\033[?25h\033[?1049l")
-            sys.stdout.flush()
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        self._init_colors(scr)
+        scr.timeout(500)
+        entries: list = []
+        next_save = time.monotonic() + self.args.save_interval
+        views = ["auto", "table", "radar"]
+        while not self.stop.is_set():
+            self._draw(scr, entries)
+            ch = scr.getch()
+            if ch in (ord("q"), ord("Q")):
+                self.stop.set()
+            elif ch in (ord("s"), ord("S")):
+                self._safe_save()
+            elif ch in (ord("v"), ord("V"), 9):
+                self.view = views[(views.index(self.view) + 1) % len(views)]
+            elif ch in (ord("+"), ord("=")):
+                self._step_range(entries, +1)
+            elif ch in (ord("-"), ord("_")):
+                self._step_range(entries, -1)
+            elif ch in (ord("a"), ord("A")):
+                self.range_km = None
+            if time.monotonic() >= next_save:
+                self._safe_save()
+                next_save = time.monotonic() + self.args.save_interval
 
     def _headless_loop(self) -> None:
         next_save = time.monotonic() + self.args.save_interval
@@ -1361,7 +1352,7 @@ class App:
             fix = self.gps.snapshot()
             print(f"[{time.strftime('%H:%M:%S')}] sdr={self.stats.sdr_state} gps={fix.status} "
                   f"aircraft={len(self.table.snapshot(self.args.max_age))} rows={self.stats.log_rows} "
-                  f"msgs/s={self.stats.msgs_rate:.0f}", flush=True)
+                  f"msgs/s={self.stats.msgs_rate:.0f} feed={self.stats.feed_kind}", flush=True)
             if time.monotonic() >= next_save:
                 self._safe_save()
                 next_save = time.monotonic() + self.args.save_interval
@@ -1392,31 +1383,40 @@ class App:
         self.gps.start()
         engine.start()
 
+        self.ctl = Dump1090Controller(self.binary, self.json_dir, extra_decoder_args(a), a.raw_host, a.raw_port,
+                                      use_raw=not a.no_raw, stop_evt=self.stop)
         if a.no_spawn:
             self.stats.sdr_state, self.stats.sdr_detail = "EXTERNAL", "using an already-running decoder"
-            if a.json_dir:
-                self._start_source("json", a.json_dir)
+            if self.ctl.use_raw and self.ctl.is_port_open():
+                self._start_sources("raw", external=True)
+            elif a.json_dir or self._rssi_dir(True):
+                self._start_sources("json", external=True)
             else:
-                found = next((d for d in COMMON_JSON_DIRS if os.path.exists(os.path.join(d, "aircraft.json"))), "")
-                if found:
-                    self._start_source("json", found)
-                else:
-                    self._start_source("sbs")
+                self._start_sources("sbs")
         else:
-            self.sdr = SdrSupervisor(self.binary or "", a, self.json_dir, self.stats, self.stop,
-                                     lambda mode: self._start_source(mode))
+            self.sdr = SdrSupervisor(self.ctl, self.stats, self.stop,
+                                     lambda mode, external: self._start_sources(mode, external))
             self.sdr.start()
 
-        interactive = sys.stdout.isatty() and not a.no_ui
+        interactive = sys.stdout.isatty() and sys.stdin.isatty() and not a.no_ui
         try:
             if interactive:
-                self._ui_loop()
+                locale.setlocale(locale.LC_ALL, "")
+                try:
+                    curses.wrapper(self._curses_main)
+                except curses.error as exc:
+                    say(f"curses unavailable ({exc}); continuing headless")
+                    self._headless_loop()
             else:
                 self._headless_loop()
         finally:
             self.stop.set()
+            for src in self.sources:
+                src.halt.set()
             if self.sdr:
                 self.sdr.terminate()
+            elif self.ctl:
+                self.ctl.shutdown()
             for t in (engine, self.gps):
                 t.join(timeout=2.0)
             self._safe_save()
@@ -1454,10 +1454,12 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=f"{GITHUB}  |  {HANDLE}")
     g = p.add_argument_group("GPS")
     g.add_argument("--gps", choices=["auto", "gpsd", "serial", "none"], default="auto",
-                   help="GPS source (default: auto = gpsd first, then scan serial ports)")
+                   help="GPS source, u-blox receivers only (default: auto = gpsd first, then u-blox USB devices)")
     g.add_argument("--gpsd-host", default="127.0.0.1")
     g.add_argument("--gpsd-port", type=int, default=2947)
-    g.add_argument("--gps-serial", metavar="PORT", help="NMEA serial port, e.g. /dev/ttyUSB0, /dev/ttyACM0, /dev/serial0")
+    g.add_argument("--gps-serial", metavar="PORT",
+                   help="u-blox serial port, e.g. /dev/ttyACM0 or /dev/serial0. Anything that is not a u-blox "
+                        "USB device is verified with a read-only UBX-MON-VER poll and rejected if it fails")
     g.add_argument("--gps-baud", type=int, default=9600, help="baud rate for --gps-serial (default 9600)")
     g.add_argument("--fixed-pos", type=fixed_pos_type, metavar="LAT,LON[,ALT_M]",
                    help="use a fixed receiver position instead of GPS (bench testing / static site)")
@@ -1465,6 +1467,10 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--dump1090", metavar="PATH", help="path to a dump1090-family binary")
     d.add_argument("--no-spawn", action="store_true", help="do not start a decoder; read an existing one")
     d.add_argument("--json-dir", metavar="DIR", help="directory holding aircraft.json (with --no-spawn)")
+    d.add_argument("--raw-host", default="127.0.0.1", help="host of the raw-hex feed (default 127.0.0.1)")
+    d.add_argument("--raw-port", type=int, default=30002, help="raw-hex feed port decoded with pyModeS (default 30002)")
+    d.add_argument("--no-raw", action="store_true",
+                   help="skip the pyModeS raw decoder; use the decoder's own aircraft.json/SBS output (native RSSI)")
     d.add_argument("--sbs-host", default="127.0.0.1")
     d.add_argument("--sbs-port", type=int, default=30003)
     d.add_argument("--gain", metavar="DB", help="tuner gain in dB (default: decoder's auto gain)")
@@ -1483,7 +1489,7 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--sort", choices=["dist", "seen", "rssi"], default="dist")
     u.add_argument("--max-age", type=float, default=60.0, help="hide aircraft not heard for N seconds (default 60)")
     u.add_argument("--ascii", action="store_true", help="plain ASCII banner/lines (no box-drawing characters)")
-    u.add_argument("--no-ui", action="store_true", help="headless: log only, print a status line every 10 s")
+    u.add_argument("--no-ui", action="store_true", help="headless: log only, print a status line every 10 s (no curses)")
     s = p.add_argument_group("maintenance")
     s.add_argument("--setup", action="store_true", help="install dependencies, configure udev/gpsd, build dump1090, then exit")
     s.add_argument("--skip-gpsd-config", action="store_true", help="with --setup: leave /etc/default/gpsd alone")
@@ -1495,6 +1501,7 @@ def build_parser() -> argparse.ArgumentParser:
 def run_check(args: argparse.Namespace, distro: Distro, binary: Optional[str]) -> int:
     say(f"OS          : {distro.friendly} ({distro.pretty}) [{distro.family}]")
     say(f"decoder     : {binary or 'NOT FOUND (run: python3 aeros.py --setup)'}")
+    say(f"pyModeS     : {'OK (v2 API)' if HAVE_PYMODES else PYMODES_ERROR + ' -> fallback to decoder JSON/SBS'}")
     devs = rtlsdr_devices()
     say(f"RTL-SDR USB : {', '.join(devs) if devs else 'not detected'}")
     if dvb_driver_loaded():
@@ -1510,11 +1517,14 @@ def run_check(args: argparse.Namespace, distro: Distro, binary: Optional[str]) -
     ublox_seen = False
     for port in ports:
         info = usb_info_for_tty(port)
-        if info:
-            ublox_seen = ublox_seen or info[0] == "1546"
-            say(f"  {port}: {info[2]} ({info[0]}:{info[1]})")
+        if info and info[0] == UBLOX_VID:
+            ublox_seen = True
+            say(f"  {port}: {info[2]} ({info[0]}:{info[1]})  -> u-blox, usable")
+        elif info:
+            say(f"  {port}: {info[2]} ({info[0]}:{info[1]})  -> not u-blox: ignored by auto mode; "
+                f"--gps-serial would require a UBX-MON-VER reply")
         else:
-            say(f"  {port}: not USB (UART / other)")
+            say(f"  {port}: not USB (UART/other)  -> needs --gps-serial; verified with UBX-MON-VER")
     if ublox_seen and shutil.which("systemctl"):
         mm = subprocess.run(["systemctl", "is-active", "--quiet", "ModemManager"]).returncode == 0
         if mm:
@@ -1547,6 +1557,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
     if binary:
         say(f"decoder: {binary}")
+    if args.no_raw:
+        say("raw decoding disabled (--no-raw): using the decoder's own output")
+    elif not HAVE_PYMODES:
+        say(f"{PYMODES_ERROR}; using the decoder's own JSON/SBS output instead")
     if not args.no_spawn:
         devs = rtlsdr_devices()
         if not devs:
