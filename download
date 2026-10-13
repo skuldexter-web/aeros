@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+
+# AERØS output — contains your GPS track, never commit it
+logs/
+AEROS_*.log
+AEROS_*.csv
+AEROS_*.kml
+*.kml.tmp
+
+# Local decoder build / editor
+.cache/
+.vscode/
+.idea/
+*.swp

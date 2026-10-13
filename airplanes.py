@@ -181,6 +181,13 @@ class AircraftTable:
                 if v is not None:
                     setattr(ac, k, v)
 
+    def mark_fresh(self, icao: str) -> None:
+        """Offer an aircraft to the logger again on the next tick."""
+        with self._lock:
+            ac = self._ac.get(icao)
+            if ac is not None:
+                ac.fresh = True
+
     def drain_fresh(self) -> List[Aircraft]:
         with self._lock:
             out = [Aircraft(**{**a.__dict__}) for a in self._ac.values() if a.fresh]

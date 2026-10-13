@@ -14,7 +14,7 @@ the top of the terminal while a cyan live table updates underneath.
  ██████  █████   █████   █  █ █   ████
  █    █  █       █   █   ██   █       █
  █    █  ██████  █    █   ████   █████
- passive aircraft tracking · v1.1.0
+ passive aircraft tracking · v1.2.1
 ```
 
 ## Features
@@ -62,7 +62,7 @@ the top of the terminal while a cyan live table updates underneath.
 
 | Path | What AERØS does |
 |---|---|
-| `--gps auto` (default) | Uses gpsd, or any **USB serial device with vendor ID `1546`**. Every other port (ESP32, Arduino, FTDI, CP210x, CNC controllers…) is **never opened and never written to**. |
+| `--gps auto` (default) | Uses gpsd, or scans for **USB serial devices with vendor ID `1546`** and **keeps scanning until one answers** (see below). Every other port (ESP32, Arduino, FTDI, CP210x, CNC controllers…) is **never opened and never written to**, unless you opt in with `--scan-bridges`. |
 | gpsd | Accepts data only from a gpsd device whose driver is `u-blox` (or a `1546` USB device). Anything else shows `REJECTED` and no position is used. gpsd gets 12 s to identify the receiver. |
 | `--gps-serial PORT` (UART, USB-serial bridge, unknown) | Sends **one read-only `UBX-MON-VER` query** and trusts the port only if a checksum-valid reply comes back. No reply → `REJECTED`, nothing is parsed, and it is not retried. |
 
@@ -84,6 +84,14 @@ AERØS ever writes to a GPS, and only for ports you name yourself that are not u
 - Use either gpsd or direct serial on one port, not both. `--gps auto` prefers gpsd.
 - AERØS never changes receiver configuration. Your u-blox settings stay untouched (see the rule table above for the one read-only query).
 
+### Driver management and port auto-discovery
+
+- **Kernel driver.** At install and at every startup AERØS checks `cdc_acm` (loaded, built into the kernel, available, or missing). If it is available but not loaded it runs `sudo modprobe cdc_acm` and persists it. If it is missing it says so (on Ubuntu/Mint, `--setup` tries `linux-modules-extra-$(uname -r)`; after a kernel update a reboot is usually needed). Use `--no-auto-fix` to forbid the `sudo` calls.
+- **Permissions.** If you are not in `dialout`, AERØS adds you. If you are in it but your current login session predates that, and a u-blox port is unreadable, it re-launches itself once under `sg dialout` so no re-login is needed.
+- **No hard-coded port.** Ports are enumerated at runtime with `serial.tools.list_ports` plus every `/dev/ttyACM*` and `/dev/ttyUSB*`, so renumbering (`ttyACM0` → `ttyACM1`) and hot-plug just work.
+- **Scan until it answers.** AERØS scans every 2 s. Each u-blox candidate is opened exclusively and *passively* read for up to 4 s until a checksum-valid NMEA sentence or UBX frame arrives (nothing is written). Then it locks on. Silent ports are retried, unplugging returns it to scanning, and the status line shows `SCANNING` / `VERIFYING` / `NO ACCESS` / `REJECTED` with the reason and the scan number.
+- A u-blox configured for **UBX-only** output is recognised and reported (`enable NMEA or use gpsd`) rather than treated as dead.
+
 ## Installation
 
 ```bash
@@ -96,6 +104,7 @@ cd AEROS
 
 1. installs `rtl-sdr librtlsdr-dev gpsd gpsd-clients python3-pip build-essential git pkg-config libusb-1.0-0-dev libncurses-dev python3-serial` via `apt`;
 2. blacklists the DVB-T kernel driver (`dvb_usb_rtl28xxu`) that otherwise steals the dongle, adds a udev rule (`plugdev`) and adds you to `plugdev` + `dialout`;
+   `install.sh` and the app also verify the **`cdc_acm`** kernel driver that u-blox USB receivers need (`/dev/ttyACM*`): they `modprobe cdc_acm` if it is not loaded, persist it in `/etc/modules-load.d/`, and add you to `dialout`;
 3. writes `/etc/default/gpsd` (`USBAUTO=true`, `-n`; the original is kept as `/etc/default/gpsd.aeros.bak`) — skip with `--skip-gpsd-config`;
 4. clones and builds `flightaware/dump1090` (falls back to `antirez/dump1090`) and installs it as `/usr/local/bin/dump1090-aeros`.
 
@@ -106,6 +115,17 @@ Python dependencies: `pyModeS<3` (raw decoding) and optional `pyserial` (direct 
 Non-apt distributions: install the packages above manually and pass `--dump1090 /path/to/binary`.
 
 Run `python3 aeros.py --check` for a diagnostic of dongle, decoder, gpsd and serial ports.
+
+### Kali Linux notes
+
+AERØS is developed with Kali Linux in mind (Debian-based, `apt`, rolling release). Things that matter there:
+
+- **Virtual machine?** The dongle and the GPS must be attached to the *guest* (VirtualBox: Devices > USB, and USB 2.0/3.0 needs the Extension Pack; VMware: VM > Removable Devices > Connect). `python3 aeros.py --check` detects a VM and says so when no dongle is visible.
+- **Python and pip.** Current Kali marks the system Python as externally managed (PEP 668). `--setup` installs `pyModeS<3` with `pip install --user`, retries with `--break-system-packages`, and installs for *your* user even when you ran `sudo ./install.sh`.
+- **Build.** dump1090-fa is built with its `-Werror` removed so a newer rolling-release gcc cannot fail the build over a new warning. The binary lands in `/usr/local/bin/dump1090-aeros`.
+- **After `apt full-upgrade`** the running kernel may no longer match `/lib/modules`; if `--check` says `cdc_acm: missing`, reboot.
+- **ModemManager** is common on Kali desktops; `--setup` installs a udev rule so it ignores u-blox devices (replug the GPS once).
+- **Root or normal user** both work. As the default non-root user you need `plugdev` (dongle) and `dialout` (GPS); AERØS adds you and re-launches itself with `sg dialout` when needed.
 
 ## Usage
 
@@ -138,6 +158,8 @@ The table and scope sit side by side on terminals at least 104 columns wide; on 
 | `--json-dir DIR` | auto | directory containing `aircraft.json` |
 | `--raw-host` / `--raw-port` | `127.0.0.1` / `30002` | raw-hex feed decoded with pyModeS |
 | `--no-raw` | off | skip pyModeS; use the decoder's own `aircraft.json` / SBS output (native RSSI) |
+| `--scan-bridges` | off | also scan non-u-blox USB-serial ports (e.g. `/dev/ttyUSB*`); a port is used only if it answers a read-only `UBX-MON-VER` query |
+| `--no-auto-fix` | off | never run `sudo modprobe` / `usermod` at startup, only report problems |
 | `--sbs-host` / `--sbs-port` | `127.0.0.1` / `30003` | SBS-1 feed fallback |
 | `--gain DB` / `--device-index N` | decoder default | passed to the decoder |
 | `--dump1090-args "…"` | – | extra raw decoder arguments |
@@ -193,6 +215,8 @@ needed for a trivial conversion script.
 | `dongle busy: DVB driver loaded` | `python3 aeros.py --setup`, unplug/replug, or `sudo modprobe -r dvb_usb_rtl28xxu`. |
 | `USB permission denied` | Re-login after `--setup` (plugdev), or run with `sudo`. |
 | `GPS REJECTED` | The device is not a u-blox, or (UART) its RX pin is not wired so it can't answer the version query. Only u-blox modules are supported. |
+| `GPS SCANNING` | Normal while no u-blox is present, the status line says what was seen (`scan #N`, skipped ports, silent ports). Plug the module in; it locks on by itself, even under a new `/dev/ttyACM*` number. |
+| `GPS NO ACCESS` | Port exists but permission was denied: AERØS adds you to `dialout` and re-launches itself with `sg dialout`; if that cannot work, log out/in or run `newgrp dialout`. |
 | `GPS NO DEVICE` | `python3 aeros.py --check`; start gpsd (`sudo systemctl start gpsd.socket`) or pass `--gps-serial`. |
 | `GPS NO FIX` / "not logging" | Move the antenna outdoors/with sky view; cold start can take several minutes. |
 | `GPS DISCONNECTED … port is in use` | gpsd holds the port: use `--gps gpsd`, or stop gpsd for direct serial. |

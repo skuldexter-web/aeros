@@ -57,7 +57,7 @@ from airplanes import (  # noqa: E402  (decoder side lives in airplanes.py)
 # ─────────────────────────────────────────────────────────────────────────────
 APP_NAME = "AERØS"
 APP_ID = "AEROS"
-VERSION = "1.1.0"
+VERSION = "1.2.1"
 SUBTITLE = "passive aircraft tracking"
 GITHUB = "github.com/skuldexter-web"
 HANDLE = "@s.k.7.l.d"
@@ -97,7 +97,8 @@ APT_PACKAGES = [
 ]
 BUILD_TARGETS = [
     ("dump1090-fa", "https://github.com/flightaware/dump1090.git",
-     ["dump1090", "RTLSDR=yes", "BLADERF=no", "HACKRF=no", "LIMESDR=no", "DUMP1090_VERSION=aeros"]),
+     ["dump1090", "RTLSDR=yes", "BLADERF=no", "HACKRF=no", "LIMESDR=no", "DUMP1090_VERSION=aeros",
+      "DUMP1090_CFLAGS=-std=c11 -fno-common -Wall -Wmissing-declarations -Wformat-signedness -W"]),
     ("dump1090-classic", "https://github.com/antirez/dump1090.git", []),
 ]
 FRIENDLY_DISTROS = {
@@ -154,9 +155,9 @@ class Distro:
     family: str  # "debian" | "unknown"
 
 
-def detect_distro() -> Distro:
+def detect_distro(paths: Tuple[str, ...] = ("/etc/os-release", "/usr/lib/os-release")) -> Distro:
     info: Dict[str, str] = {}
-    for path in ("/etc/os-release", "/usr/lib/os-release"):
+    for path in paths:
         try:
             with open(path, encoding="utf-8") as fh:
                 for line in fh:
@@ -190,6 +191,20 @@ def rtlsdr_devices() -> List[str]:
         if (vid, pid) in RTL_USB_IDS:
             found.append(f"{vid}:{pid}")
     return found
+
+
+def detect_virt() -> str:
+    """Name of the hypervisor when running in a VM (typical for Kali), else ''."""
+    try:
+        out = subprocess.run(["systemd-detect-virt"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return "" if out in ("", "none") else out
+
+
+VM_USB_HINT = ("USB devices must be attached to the VM itself (VirtualBox: Devices > USB, USB 2.0/3.0 needs the "
+               "Extension Pack; VMware: VM > Removable Devices > Connect)")
 
 
 def dvb_driver_loaded() -> bool:
@@ -238,6 +253,181 @@ def usb_info_for_tty(port: str) -> Optional[Tuple[str, str, str]]:
 def is_ublox(port: str) -> bool:
     info = usb_info_for_tty(port)
     return bool(info and info[0] == UBLOX_VID)
+
+
+@dataclasses.dataclass
+class PortInfo:
+    device: str
+    vid: Optional[str] = None
+    pid: Optional[str] = None
+    label: str = ""
+    usb: bool = False
+
+    @property
+    def ublox(self) -> bool:
+        return self.vid == UBLOX_VID
+
+
+def discover_serial_ports() -> List[PortInfo]:
+    """Enumerate USB serial ports dynamically: serial.tools.list_ports first, then every
+    /dev/ttyACM* and /dev/ttyUSB* node. No path is assumed; ports may appear, vanish or be renumbered."""
+    found: Dict[str, PortInfo] = {}
+    if serial is not None:
+        try:
+            from serial.tools import list_ports
+            for lp in list_ports.comports():
+                if lp.vid is None:
+                    continue  # not a USB device (legacy UARTs are only used when named with --gps-serial)
+                vid, pid = f"{lp.vid:04x}", f"{(lp.pid or 0):04x}"
+                label = UBLOX_PRODUCTS.get(pid, "u-blox") if vid == UBLOX_VID else (lp.product or lp.description or f"{vid}:{pid}")
+                found[os.path.realpath(lp.device)] = PortInfo(lp.device, vid, pid, label, True)
+        except Exception:  # pragma: no cover - list_ports quirks must never break scanning
+            pass
+    for dev in sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")):
+        real = os.path.realpath(dev)
+        if real in found:
+            continue
+        info = usb_info_for_tty(dev)
+        found[real] = PortInfo(dev, info[0], info[1], info[2], True) if info else PortInfo(dev)
+    ports = list(found.values())
+    ports.sort(key=lambda p: (not p.ublox, not p.device.startswith("/dev/ttyACM"), p.device))
+    return ports
+
+
+def classify_stream(buf: bytes) -> str:
+    """'nmea' if a checksum-valid NMEA sentence is present, 'ubx' for a checksum-valid UBX frame, else ''."""
+    for line in buf.split(b"\n"):
+        text = line.decode("ascii", "ignore").strip()
+        if text.startswith("$") and nmea_valid(text):
+            return "nmea"
+    i = 0
+    while True:
+        i = buf.find(b"\xb5\x62", i)
+        if i < 0 or len(buf) < i + 8:
+            return ""
+        length = buf[i + 4] | (buf[i + 5] << 8)
+        end = i + 6 + length + 2
+        if length <= 2048 and len(buf) >= end and ubx_checksum(buf[i + 2:i + 6 + length]) == buf[i + 6 + length:end]:
+            return "ubx"
+        i += 2
+
+
+def verify_stream(ser, stop_evt: threading.Event, timeout: float = 4.0) -> str:
+    """Passively read until a valid NMEA sentence or UBX frame shows up (writes nothing)."""
+    buf = b""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end and not stop_evt.is_set():
+        chunk = ser.read(256)
+        if chunk:
+            buf = (buf + chunk)[-8192:]
+            kind = classify_stream(buf)
+            if kind:
+                return kind
+    return ""
+
+
+def cdc_acm_state(proc_modules: str = "/proc/modules", sys_module: str = "/sys/module/cdc_acm",
+                  release: Optional[str] = None) -> str:
+    """State of the cdc_acm kernel driver (u-blox USB GPS modules enumerate as /dev/ttyACM*):
+    'loaded' | 'builtin' | 'available' (module exists, not loaded) | 'missing'."""
+    try:
+        with open(proc_modules) as fh:
+            if any(line.split(" ", 1)[0] == "cdc_acm" for line in fh):
+                return "loaded"
+    except OSError:
+        pass
+    if os.path.isdir(sys_module):
+        return "loaded"
+    release = release or os.uname().release
+    try:
+        with open(f"/lib/modules/{release}/modules.builtin") as fh:
+            if "cdc-acm.ko" in fh.read():
+                return "builtin"
+    except OSError:
+        pass
+    try:
+        if subprocess.run(["modinfo", "-n", "cdc_acm"], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0:
+            return "available"
+    except OSError:
+        pass
+    return "missing"
+
+
+def _priv_auto(cmd: List[str]) -> List[str]:
+    """sudo for system changes; never hang on a password prompt when there is no terminal."""
+    if os.geteuid() == 0:
+        return cmd
+    return ["sudo"] + ([] if sys.stdin.isatty() else ["-n"]) + cmd
+
+
+def ensure_cdc_acm(fix: bool = True) -> Tuple[str, str]:
+    state = cdc_acm_state()
+    if state in ("loaded", "builtin"):
+        return state, f"cdc_acm kernel driver ok ({state})"
+    if state == "available":
+        if not fix:
+            return state, "cdc_acm is not loaded (run: sudo modprobe cdc_acm)"
+        if _run(_priv_auto(["modprobe", "cdc_acm"])).returncode == 0:
+            _run(_priv_auto(["tee", "/etc/modules-load.d/aeros-cdc_acm.conf"]),
+                 input=b"# Written by AERO\xc3\x98S: u-blox USB GPS modules need cdc_acm\ncdc_acm\n",
+                 stdout=subprocess.DEVNULL)
+            return cdc_acm_state(), "loaded cdc_acm and set it to load at boot"
+        return state, "modprobe cdc_acm failed (sudo needed): run it manually"
+    return state, ("kernel has no cdc_acm module: reboot if the kernel was just updated, or on Ubuntu "
+                   "install linux-modules-extra-$(uname -r)")
+
+
+def dialout_state() -> Tuple[bool, bool]:
+    """(user listed in the dialout group, group active in this login session)."""
+    try:
+        import grp
+        import pwd
+    except ImportError:  # pragma: no cover
+        return True, True
+    if os.geteuid() == 0:
+        return True, True
+    try:
+        g = grp.getgrnam("dialout")
+    except KeyError:
+        return True, True  # distro without dialout: do not nag
+    user = os.environ.get("SUDO_USER") or getpass.getuser()
+    try:
+        primary = pwd.getpwnam(user).pw_gid
+    except KeyError:
+        primary = -1
+    return (user in g.gr_mem or primary == g.gr_gid), (g.gr_gid in os.getgroups() or os.getegid() == g.gr_gid)
+
+
+def reexec_with_dialout() -> None:
+    """Re-launch this program once under `sg dialout` so a freshly added group works without re-login."""
+    if os.environ.get("AEROS_SG") or not shutil.which("sg"):
+        return
+    env = dict(os.environ, AEROS_SG="1")
+    cmd = " ".join(shlex.quote(x) for x in [sys.executable] + sys.argv)
+    os.execvpe("sg", ["sg", "dialout", "-c", cmd], env)
+
+
+def prepare_usb_serial(args: argparse.Namespace, fix: bool = True) -> None:
+    """Startup hardware prep for u-blox USB GPS: kernel driver + serial-port permissions."""
+    state, msg = ensure_cdc_acm(fix)
+    say(f"USB-serial driver: {msg}")
+    in_db, in_session = dialout_state()
+    user = os.environ.get("SUDO_USER") or getpass.getuser()
+    if not in_db:
+        if fix and _run(_priv_auto(["usermod", "-aG", "dialout", user])).returncode == 0:
+            say(f"added {user} to the 'dialout' group")
+            in_db = True
+        else:
+            say(f"{RED}warning: {user} is not in 'dialout'; serial ports may be unreadable "
+                f"(sudo usermod -aG dialout {user}){RESET}")
+    if in_db and not in_session:
+        blocked = [p.device for p in discover_serial_ports()
+                   if p.ublox and not os.access(p.device, os.R_OK | os.W_OK)]
+        if blocked:
+            say(f"no permission on {', '.join(blocked)} in this session: re-launching with the dialout group")
+            reexec_with_dialout()
+            say("could not apply the group automatically: log out/in or run `newgrp dialout`")
 
 
 def ubx_checksum(data: bytes) -> bytes:
@@ -359,6 +549,9 @@ def build_dump1090() -> Optional[str]:
 def install_pymodes() -> bool:
     """pyModeS must stay on the 2.x API (3.x removed it). Retries with --break-system-packages on PEP 668 distros."""
     cmd = [sys.executable, "-m", "pip", "install", "--user", "pyModeS>=2.13,<3"]
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+        cmd = ["sudo", "-u", sudo_user] + cmd  # `sudo ./install.sh`: install for the real user, not for root
     if _run(cmd).returncode == 0:
         return True
     return _run(cmd + ["--break-system-packages"]).returncode == 0
@@ -409,6 +602,13 @@ def setup_system(args: argparse.Namespace) -> int:
         for grp in ("plugdev", "dialout"):
             if subprocess.run(["getent", "group", grp], stdout=subprocess.DEVNULL).returncode == 0:
                 _run(_priv(["usermod", "-aG", grp, user]))
+
+    # 2b. kernel driver for u-blox USB GPS (cdc_acm) + persistence
+    state, msg = ensure_cdc_acm(True)
+    if state == "missing" and ("ubuntu" in [d.ident] + d.like):
+        _apt_install(["linux-modules-extra-" + os.uname().release])
+        state, msg = ensure_cdc_acm(True)
+    say(f"USB-serial driver: {msg}")
 
     # 3. gpsd
     if not getattr(args, "skip_gpsd_config", False):
@@ -518,7 +718,8 @@ class GpsSupervisor(threading.Thread):
         self._updated = 0.0
         self._sv: Dict[str, int] = {}
         self._note = ""
-        self._rejected: Dict[str, str] = {}   # serial ports that failed the u-blox check (sticky)
+        self._rejected: Dict[str, Tuple[str, float]] = {}   # ports that failed the u-blox check (re-checked after 120 s)
+        self._scan_no = 0
         self._gdev: Dict[str, dict] = {}      # gpsd devices seen this session
 
     # -- state ---------------------------------------------------------------
@@ -553,23 +754,15 @@ class GpsSupervisor(threading.Thread):
             self._status("DISABLED", "GPS disabled (--gps none)")
             return
         while not self.stop_evt.is_set():
-            connected = False
+            locked = False
             if a.gps in ("auto", "gpsd"):
-                connected = self._gpsd_session()
-            if not connected and a.gps in ("auto", "serial"):
-                port, baud = a.gps_serial, a.gps_baud
-                if not port:
-                    found = self._autodetect_serial()
-                    port, baud = found if found else (None, None)
-                if port:
-                    if port in self._rejected:
-                        self._status("REJECTED", self._rejected[port])
-                    else:
-                        self._serial_session(port, baud)
-                    connected = True
-            if not connected:
-                self._status("NO DEVICE", self._note or "no GPS found (gpsd / serial)")
-            self.stop_evt.wait(3.0 if connected else 10.0)
+                locked = self._gpsd_session()
+            if not locked and a.gps in ("auto", "serial"):
+                self._scan_no += 1
+                locked = self._serial_scan()
+            if not locked and a.gps == "gpsd":
+                self._status("NO DEVICE", self._note or "gpsd has no GPS")
+            self.stop_evt.wait(2.0)  # keep scanning until a responding u-blox is found (also handles hot-plug)
 
     # -- gpsd ----------------------------------------------------------------
     def _gpsd_session(self) -> bool:
@@ -706,48 +899,69 @@ class GpsSupervisor(threading.Thread):
         except TypeError:  # pyserial < 3.3
             return serial.Serial(port, baud, timeout=timeout)
 
-    def _autodetect_serial(self) -> Optional[Tuple[str, int]]:
-        """Auto mode only ever considers USB devices with the u-blox vendor ID (1546).
-        Every other port is left alone: it is neither opened nor written to."""
+    def _serial_scan(self) -> bool:
+        """One scan pass over whatever serial ports exist right now. Returns True once a u-blox was
+        verified and used (the call blocks while it stays connected)."""
+        a = self.args
+        n = self._scan_no
         if serial is None:
-            self._note = "pyserial missing (apt install python3-serial) — serial GPS unavailable"
-            return None
-        ports = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
-        good = [p for p in ports if is_ublox(p)]
-        if good:
-            return good[0], self.args.gps_baud  # baud is irrelevant over USB
-        ignored = len(ports)
-        self._note = ("no u-blox USB GPS found (vendor 1546)"
-                      + (f"; ignored {ignored} non-u-blox serial port(s)" if ignored else "")
-                      + ". Only u-blox modules are supported; UART modules need --gps-serial")
-        return None
+            self._status("NO DEVICE", "pyserial missing (apt install python3-serial): serial GPS unavailable")
+            return False
+        if a.gps_serial:
+            info = usb_info_for_tty(a.gps_serial)
+            cands = [PortInfo(a.gps_serial, info[0], info[1], info[2], True) if info else PortInfo(a.gps_serial)]
+            skipped: List[str] = []
+        else:
+            ports = discover_serial_ports()
+            cands = [p for p in ports if p.ublox or (a.scan_bridges and p.usb)]
+            skipped = [p.device for p in ports if p not in cands]
+        if not cands:
+            note = f"scan #{n}: no u-blox USB GPS found"
+            if skipped:
+                note += f" ({', '.join(skipped)} skipped: not u-blox)"
+            self._status("SCANNING", note)
+            return False
+        for pi in cands:
+            if self.stop_evt.is_set():
+                return False
+            rej = self._rejected.get(pi.device)
+            if rej and time.monotonic() - rej[1] < 120:
+                self._status("REJECTED", rej[0])
+                continue
+            if self._serial_session(pi.device, a.gps_baud, pi):
+                return True
+        return False
 
-    def _serial_session(self, port: str, baud: int) -> None:
-        if serial is None:
-            self._note = "pyserial missing (apt install python3-serial)"
-            return
-        info = usb_info_for_tty(port)
-        usb_ublox = bool(info and info[0] == UBLOX_VID)
+    def _serial_session(self, port: str, baud: int, pinfo: PortInfo) -> bool:
+        n = self._scan_no
+        label = pinfo.label or "serial"
+        locked = False
         try:
             with self._open_serial(port, baud, 0.5) as ser:
-                if usb_ublox:
-                    ident = info[2]
-                else:
-                    # Not a u-blox USB device (UART, USB-serial bridge, unknown): prove it is a u-blox
-                    # with one read-only UBX-MON-VER poll before a single byte of NMEA is trusted.
-                    self._status("IDENTIFYING", f"verifying {port} is a u-blox (UBX-MON-VER)")
+                self._status("VERIFYING", f"scan #{n}: checking {port} ({label})")
+                ident = label
+                if not pinfo.ublox:
+                    # USB-serial bridge / UART / unknown: prove it is a u-blox with one read-only UBX query
                     res = ublox_handshake(ser, self.stop_evt)
                     if res is None:
                         if self.stop_evt.is_set():
-                            return
+                            return False
                         msg = (f"{port} did not answer UBX-MON-VER: not a u-blox receiver, or its RX pin "
                                f"is not wired. Unsupported")
-                        self._rejected[port] = msg
+                        self._rejected[port] = (msg, time.monotonic())
                         self._status("REJECTED", msg)
-                        return
+                        return False
                     ident = f"u-blox sw {res[0]} hw {res[1]}"
+                kind = verify_stream(ser, self.stop_evt, 4.0)  # passive: valid NMEA or UBX must arrive
+                if not kind:
+                    if not self.stop_evt.is_set():
+                        self._status("SCANNING", f"scan #{n}: {port} ({label}) is silent (no NMEA/UBX in 4 s); retrying")
+                    return False
+                ubx_only = kind == "ubx"
                 name = f"serial {port}@{baud} ({ident})"
-                self._update(source=name, status="NO FIX", error="")
+                self._update(source=name, status="NO FIX", mode=0,
+                             error="UBX-only output: enable NMEA or use gpsd" if ubx_only else "")
+                locked = True
                 ser.timeout = 1
                 last_ok = time.monotonic()
                 while not self.stop_evt.is_set():
@@ -758,13 +972,21 @@ class GpsSupervisor(threading.Thread):
                             last_ok = time.monotonic()
                             self._handle_nmea(line, name)
                     if time.monotonic() - last_ok > 10:
-                        self._status("NO DATA", f"{port} open but no valid NMEA (check baud/wiring)")
+                        self._status("NO DATA", f"{port}: " + ("only UBX frames, no NMEA (enable NMEA output)"
+                                                                if ubx_only else "no valid NMEA (check baud/wiring)"))
+                return True
         except (OSError, getattr(serial, "SerialException", OSError)) as exc:
-            hint = " — add your user to the 'dialout' group" if "ermission" in str(exc) else ""
-            if "lock" in str(exc).lower():
-                hint = " — port is in use (gpsd?); use --gps gpsd or stop gpsd"
-            self._note = f"{port}: {exc}{hint}"
-            self._status("DISCONNECTED", self._note)
+            text = str(exc)
+            if "ermission" in text:
+                self._status("NO ACCESS", f"{port}: permission denied: join the 'dialout' group (re-login or `sg dialout`)")
+            elif "lock" in text.lower():
+                self._status("SCANNING", f"scan #{n}: {port} is in use (gpsd?): use --gps gpsd or stop gpsd")
+            elif locked:
+                self._status("DISCONNECTED", f"{port} vanished; scanning for a u-blox again")
+            else:
+                self._status("SCANNING", f"scan #{n}: {port}: {text[:80]}")
+            return locked
+        return False
 
     def _handle_nmea(self, line: str, name: str) -> None:
         body = line[1:line.index("*")]
@@ -1041,6 +1263,11 @@ class WardriveEngine(threading.Thread):
                 self._last = {k: v for k, v in self._last.items() if now - v[0] < 600}
 
     def _maybe_log(self, ac, fix: GpsFix, now: float) -> None:
+        # raw mode merges RSSI from aircraft.json about a second late: give a brand-new aircraft up to 3 s
+        # so its first logged row carries the signal level
+        if ac.rssi is None and self.stats.rssi_ok and time.time() - ac.first_seen < 3.0:
+            self.table.mark_fresh(ac.icao)
+            return
         last = self._last.get(ac.icao)
         if last is not None:
             moved_m = haversine_km(last[1], last[2], fix.lat, fix.lon) * 1000.0
@@ -1215,7 +1442,7 @@ class App:
         sats = "-" if fix.sats_used is None else str(fix.sats_used)
         seen = "-" if fix.sats_seen is None else str(fix.sats_seen)
         hdop = "-" if fix.hdop is None else f"{fix.hdop:.1f}"
-        gps_bad = fix.status in ("NO DEVICE", "NO DATA", "DISABLED", "REJECTED", "DISCONNECTED")
+        gps_bad = fix.status in ("NO DEVICE", "NO DATA", "DISABLED", "REJECTED", "DISCONNECTED", "NO ACCESS")
         self._put(scr, y, 1, "GPS  ", C)
         self._put(scr, y, 6, f"{fix.status:<12}", ALERT if gps_bad else C)
         self._put(scr, y, 19, f"sats {sats}/{seen}  hdop {hdop}  {fix.source if fix.source != 'none' else ''}"
@@ -1491,6 +1718,11 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--ascii", action="store_true", help="plain ASCII banner/lines (no box-drawing characters)")
     u.add_argument("--no-ui", action="store_true", help="headless: log only, print a status line every 10 s (no curses)")
     s = p.add_argument_group("maintenance")
+    g.add_argument("--scan-bridges", action="store_true",
+                   help="also scan non-u-blox USB-serial ports (e.g. /dev/ttyUSB*) and accept a port only if it "
+                        "answers a read-only UBX-MON-VER query (writes 8 bytes to every such port)")
+    s.add_argument("--no-auto-fix", action="store_true",
+                   help="never run sudo modprobe/usermod at startup; only report driver/permission problems")
     s.add_argument("--setup", action="store_true", help="install dependencies, configure udev/gpsd, build dump1090, then exit")
     s.add_argument("--skip-gpsd-config", action="store_true", help="with --setup: leave /etc/default/gpsd alone")
     s.add_argument("--check", action="store_true", help="print a hardware/dependency diagnostic and exit")
@@ -1504,6 +1736,9 @@ def run_check(args: argparse.Namespace, distro: Distro, binary: Optional[str]) -
     say(f"pyModeS     : {'OK (v2 API)' if HAVE_PYMODES else PYMODES_ERROR + ' -> fallback to decoder JSON/SBS'}")
     devs = rtlsdr_devices()
     say(f"RTL-SDR USB : {', '.join(devs) if devs else 'not detected'}")
+    virt = detect_virt()
+    if virt:
+        say(f"virtual machine: {virt}" + ("" if devs else f"  ->  {VM_USB_HINT}"))
     if dvb_driver_loaded():
         say(f"{RED}dvb_usb_rtl28xxu kernel driver is loaded — it will block the dongle (run --setup){RESET}")
     try:
@@ -1511,20 +1746,23 @@ def run_check(args: argparse.Namespace, distro: Distro, binary: Optional[str]) -
         say(f"gpsd        : reachable at {args.gpsd_host}:{args.gpsd_port}")
     except OSError as exc:
         say(f"gpsd        : not reachable ({exc})")
-    ports = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*") +
-                   [p for p in ("/dev/serial0", "/dev/ttyAMA0") if os.path.exists(p)])
-    say(f"serial ports: {', '.join(ports) if ports else 'none'}   pyserial: {'yes' if serial else 'no'}")
+    in_db, in_sess = dialout_state()
+    say(f"cdc_acm     : {cdc_acm_state()}   dialout: member={in_db} active-this-session={in_sess}   "
+        f"pyserial: {'yes' if serial else 'no'}")
     ublox_seen = False
-    for port in ports:
-        info = usb_info_for_tty(port)
-        if info and info[0] == UBLOX_VID:
+    ports = discover_serial_ports()
+    if not ports:
+        say("serial ports: none present right now (AERØS keeps scanning at runtime)")
+    for pi in ports:
+        access = "ok" if os.access(pi.device, os.R_OK | os.W_OK) else "NO ACCESS"
+        if pi.ublox:
             ublox_seen = True
-            say(f"  {port}: {info[2]} ({info[0]}:{info[1]})  -> u-blox, usable")
-        elif info:
-            say(f"  {port}: {info[2]} ({info[0]}:{info[1]})  -> not u-blox: ignored by auto mode; "
-                f"--gps-serial would require a UBX-MON-VER reply")
+            say(f"  {pi.device}: {pi.label} ({pi.vid}:{pi.pid})  -> u-blox, usable, access {access}")
+        elif pi.usb:
+            say(f"  {pi.device}: {pi.label} ({pi.vid}:{pi.pid})  -> not u-blox: skipped by auto scan "
+                f"(--scan-bridges verifies via UBX-MON-VER)")
         else:
-            say(f"  {port}: not USB (UART/other)  -> needs --gps-serial; verified with UBX-MON-VER")
+            say(f"  {pi.device}: not USB  -> skipped; name it with --gps-serial to verify via UBX-MON-VER")
     if ublox_seen and shutil.which("systemctl"):
         mm = subprocess.run(["systemctl", "is-active", "--quiet", "ModemManager"]).returncode == 0
         if mm:
@@ -1543,6 +1781,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     binary = find_dump1090(args.dump1090)
     if args.check:
         return run_check(args, distro, binary)
+    if args.gps in ("auto", "serial") and not args.fixed_pos:
+        prepare_usb_serial(args, fix=not args.no_auto_fix)
 
     say(f"{APP_NAME} v{VERSION} — {distro.friendly}")
     if not args.no_spawn and binary is None:
@@ -1565,6 +1805,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         devs = rtlsdr_devices()
         if not devs:
             say(f"{RED}warning: no RTL-SDR dongle seen on USB — will keep retrying{RESET}")
+            if detect_virt():
+                say(f"running in a VM ({detect_virt()}): {VM_USB_HINT}")
         if dvb_driver_loaded():
             say(f"{RED}warning: DVB kernel driver loaded; it can block the dongle (python3 aeros.py --setup){RESET}")
     if args.gps == "serial" and not args.gps_serial and not args.fixed_pos:

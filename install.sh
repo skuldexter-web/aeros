@@ -45,6 +45,46 @@ $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-seri
 
 chmod +x aeros.py
 
+# --- USB-serial support for u-blox GPS modules ---------------------------------
+# u-blox USB receivers enumerate as CDC-ACM devices (/dev/ttyACM*), which needs the cdc_acm kernel driver.
+KVER="$(uname -r)"
+cdc_acm_state() {
+  if grep -q '^cdc_acm ' /proc/modules 2>/dev/null || [ -d /sys/module/cdc_acm ]; then echo loaded
+  elif grep -q 'cdc-acm\.ko' "/lib/modules/${KVER}/modules.builtin" 2>/dev/null; then echo builtin
+  elif modinfo -n cdc_acm >/dev/null 2>&1; then echo available
+  else echo missing; fi
+}
+
+state="$(cdc_acm_state)"
+if [ "$state" = "missing" ] && { [ "${ID}" = "ubuntu" ] || [[ " ${ID_LIKE} " == *" ubuntu "* ]]; }; then
+  say "cdc_acm not found; trying linux-modules-extra-${KVER}"
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-modules-extra-${KVER}" || true
+  state="$(cdc_acm_state)"
+fi
+case "$state" in
+  loaded|builtin) say "cdc_acm kernel driver: ok (${state})" ;;
+  available)
+    say "loading cdc_acm kernel driver"
+    if $SUDO modprobe cdc_acm; then
+      printf '# Written by AERØS: u-blox USB GPS modules need cdc_acm\ncdc_acm\n' \
+        | $SUDO tee /etc/modules-load.d/aeros-cdc_acm.conf >/dev/null
+      say "cdc_acm loaded and set to load at boot"
+    else
+      say "WARNING: modprobe cdc_acm failed"
+    fi ;;
+  *) say "WARNING: this kernel (${KVER}) has no cdc_acm module. Reboot if the kernel was just updated." ;;
+esac
+
+# serial-port permissions: /dev/ttyACM* and /dev/ttyUSB* belong to group dialout
+TARGET_USER="${SUDO_USER:-$(id -un)}"
+if [ "$TARGET_USER" != "root" ] && getent group dialout >/dev/null 2>&1; then
+  if id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx dialout; then
+    say "user ${TARGET_USER} is already in the dialout group"
+  else
+    $SUDO usermod -aG dialout "$TARGET_USER" && say "added ${TARGET_USER} to dialout (log out/in to apply; AERØS re-launches itself with sg when needed)"
+  fi
+fi
+
 # --- full setup (RTL-SDR, gpsd, udev, dump1090 build) -------------------------
 say "running full setup"
 python3 aeros.py --setup "$@"
