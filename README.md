@@ -14,7 +14,7 @@ the top of the terminal while a cyan live table updates underneath.
  ██████  █████   █████   █  █ █   ████
  █    █  █       █   █   ██   █       █
  █    █  ██████  █    █   ████   █████
- passive aircraft tracking · v1.2.1
+ passive aircraft tracking · v1.3.0
 ```
 
 ## Features
@@ -23,7 +23,10 @@ the top of the terminal while a cyan live table updates underneath.
   (auto-detected; restarts if it dies; retries if the dongle is unplugged).
 - **Raw-hex decoding with pyModeS** (`airplanes.py`): AERØS connects to dump1090's raw stream (`:30002`), CRC-checks each DF17 frame and decodes callsign, altitude, speed, heading and CPR position itself. If pyModeS is missing, or dump1090 cannot serve the raw port, it falls back to the decoder's own `aircraft.json` / SBS output.
 - **u-blox GPS modules only** (USB, UART or via gpsd). Other GPS hardware is detected and refused, see below. A fixed position (`--fixed-pos`) is available for bench tests.
-- **curses UI**: purple banner pinned on top; everything live is cyan on black. A live table (ICAO, callsign, Haversine distance from *you*, altitude, speed, heading, RSSI, last seen) sits next to a **north-up radar scope** with range rings, a sweep line and heading arrows.
+- **curses UI**: purple banner pinned on top; everything live is cyan on black. A live table (ICAO, callsign, squawk, Haversine distance from *you*, altitude, speed, heading, RSSI, last seen) sits next to a **north-up radar scope** with range rings, a sweep line, heading arrows and a **coverage outline** (`◦` = farthest aircraft heard in each 15° sector). A `STAT` line shows your best range, bearing and how far the receiver has travelled.
+- **Alerts**: an emergency squawk (7500 / 7600 / 7700, decoded from raw frames or taken from the decoder) lights up a reverse-video alert and its table row; `NO FRAMES for Ns` warns when the decoder is running but nothing is being received (antenna, gain, dongle).
+- **Sanity filter**: aircraft positions farther than `--max-range-km` (default 650) from the receiver are dropped, because a CPR decode across a zone boundary can land thousands of km away.
+- **Built not to die quietly**: malformed gpsd / JSON / SBS data, a full disk, an unwritable log directory, an unsupported locale or a colourless terminal all degrade with a visible message instead of killing a thread or the program.
 - Logging only happens with a valid GPS fix. Rows are streamed to disk immediately (crash-safe);
   KML is rebuilt every 60 s and on exit (Ctrl+C / `q`).
 - OS detection (Ubuntu, Kali, Linux Mint, Raspberry Pi OS, Debian…) and automatic `apt` setup,
@@ -138,6 +141,7 @@ python3 aeros.py --fixed-pos 52.3702,4.8952,5      # static site, no GPS
 python3 aeros.py --no-spawn --json-dir /run/dump1090-fa   # use a decoder that is already running
 python3 aeros.py --no-ui --output-dir /srv/aeros   # headless / service
 python3 aeros.py --units nm --sort rssi --gain 40
+python3 aeros.py --kml-from logs/AEROS_20261109_203015.log   # rebuild a KML after a crash
 ```
 
 Keys: `q` quit & save · `s` write KML now · `v` cycle view (auto / table / radar) · `+` `-` radar range · `a` auto range. `Ctrl+C` also saves cleanly.
@@ -158,6 +162,7 @@ The table and scope sit side by side on terminals at least 104 columns wide; on 
 | `--json-dir DIR` | auto | directory containing `aircraft.json` |
 | `--raw-host` / `--raw-port` | `127.0.0.1` / `30002` | raw-hex feed decoded with pyModeS |
 | `--no-raw` | off | skip pyModeS; use the decoder's own `aircraft.json` / SBS output (native RSSI) |
+| `--max-range-km KM` | `650` | drop aircraft positions farther than this from the receiver (`0` = off) |
 | `--scan-bridges` | off | also scan non-u-blox USB-serial ports (e.g. `/dev/ttyUSB*`); a port is used only if it answers a read-only `UBX-MON-VER` query |
 | `--no-auto-fix` | off | never run `sudo modprobe` / `usermod` at startup, only report problems |
 | `--sbs-host` / `--sbs-port` | `127.0.0.1` / `30003` | SBS-1 feed fallback |
@@ -182,7 +187,7 @@ Each run creates three files named `AEROS_<YYYYMMDD_HHMMSS>.*`:
 |---|---|
 | `.csv` | WiGLE-1.4-style CSV: `MAC`=ICAO hex, `SSID`=callsign, `AuthMode`=`[ADS-B]`, `FirstSeen` (UTC), `Channel`=1090 (MHz), `RSSI` (dBFS, int), receiver lat/lon/alt/accuracy, `Type`=`ADSB` |
 | `.log` | Full detail CSV: receiver position + satellites, ICAO, callsign, squawk, aircraft altitude/speed/track/lat/lon, RSSI, distance (km) |
-| `.kml` | Google Earth: receiver observation points + aircraft tracks |
+| `.kml` | Google Earth: receiver observation points, **your receiver track** (white line) and aircraft tracks. Built from a streamed fragment (`.kml.part`, removed on a clean exit), so saving stays fast even after hours. |
 
 The position in every row is **your receiver's GPS position at the moment of reception**; the
 aircraft's own broadcast position is kept in the `.log` / KML tracks.
@@ -215,6 +220,9 @@ needed for a trivial conversion script.
 | `dongle busy: DVB driver loaded` | `python3 aeros.py --setup`, unplug/replug, or `sudo modprobe -r dvb_usb_rtl28xxu`. |
 | `USB permission denied` | Re-login after `--setup` (plugdev), or run with `sudo`. |
 | `GPS REJECTED` | The device is not a u-blox, or (UART) its RX pin is not wired so it can't answer the version query. Only u-blox modules are supported. |
+| `LOG ERROR: … No space left` | The disk is full or the log directory vanished. Logging keeps retrying every second and resumes by itself; free some space. |
+| `NO FRAMES for Ns` | The decoder runs but decodes nothing: check antenna, gain (`--gain`), USB power, and that the 1090 MHz antenna has a view of the sky. |
+| KML missing after a crash | `python3 aeros.py --kml-from logs/AEROS_<stamp>.log` rebuilds it from the full-detail log. |
 | `GPS SCANNING` | Normal while no u-blox is present, the status line says what was seen (`scan #N`, skipped ports, silent ports). Plug the module in; it locks on by itself, even under a new `/dev/ttyACM*` number. |
 | `GPS NO ACCESS` | Port exists but permission was denied: AERØS adds you to `dialout` and re-launches itself with `sg dialout`; if that cannot work, log out/in or run `newgrp dialout`. |
 | `GPS NO DEVICE` | `python3 aeros.py --check`; start gpsd (`sudo systemctl start gpsd.socket`) or pass `--gps-serial`. |

@@ -30,7 +30,6 @@ import json
 import math
 import os
 import re
-import shlex  # noqa: F401  (kept for callers building extra args)
 import shutil
 import socket
 import subprocess
@@ -43,7 +42,7 @@ PYMODES_ERROR = ""
 try:
     import pyModeS as pms
 
-    pms.adsb.icao  # pyModeS >= 3 raises here (v2 API removed); v2.x passes
+    _ = pms.adsb.icao  # pyModeS >= 3 raises here (v2 API removed); v2.x passes
     HAVE_PYMODES = True
 except Exception:  # not installed (ImportError) or pyModeS 3.x (V2APIRemovedError, an ImportError subclass)
     import importlib.util as _ilu
@@ -60,6 +59,9 @@ DUMP1090_RAW_PORT = 30002  # --net --raw output port
 DUMP1090_SBS_PORT = 30003
 
 HEX6 = re.compile(r"[0-9A-F]{6}")
+COMMON_JSON_DIRS = ["/run/dump1090-fa", "/run/readsb", "/run/dump1090-mutability", "/run/dump1090",
+                    "/var/run/dump1090-fa", "/var/run/readsb"]
+EMERGENCY_SQUAWKS = {"7500": "HIJACK", "7600": "RADIO FAILURE", "7700": "EMERGENCY"}
 
 # dump1090 launch ladder, tried in order until one comes up.
 #   raw  -> TCP :30002 hex frames decoded by pyModeS (+ aircraft.json for RSSI if the decoder writes it)
@@ -84,12 +86,19 @@ HW_ERR = re.compile(
 
 
 def to_float(value) -> Optional[float]:
+    """float or None; NaN/inf, bools and junk become None."""
     try:
-        if value is None or value == "":
+        if value is None or value == "" or isinstance(value, bool):
             return None
-        return float(value)
-    except (TypeError, ValueError):
+        out = float(value)
+        return out if math.isfinite(out) else None
+    except (TypeError, ValueError, OverflowError):
         return None
+
+
+def to_int(value) -> Optional[int]:
+    out = to_float(value)
+    return None if out is None else int(out)
 
 
 def explain_sdr_error(text: str) -> str:
@@ -154,9 +163,35 @@ class AircraftTable:
         self._lock = threading.Lock()
         self._ac: Dict[str, Aircraft] = {}
         self.unique = 0
+        self.rejected_positions = 0
+        self._ref: Optional[tuple] = None
+        self._max_km = 0.0
+
+    @staticmethod
+    def _km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
+        return 12742.0176 * math.asin(min(1.0, math.sqrt(a)))
+
+    def set_reference(self, lat: Optional[float], lon: Optional[float], max_km: float) -> None:
+        """Receiver position used to reject impossible aircraft positions (a CPR decode across a zone
+        boundary or a stale even/odd pair can land thousands of km away). None disables the filter."""
+        with self._lock:
+            if lat is None or lon is None or max_km <= 0:
+                self._ref = None
+                return
+            self._ref, self._max_km = (lat, lon), max_km
+            for ac in self._ac.values():  # purge anything accepted before the receiver position was known
+                if ac.lat is not None and ac.lon is not None and self._km(lat, lon, ac.lat, ac.lon) > max_km:
+                    ac.lat = ac.lon = None
+                    self.rejected_positions += 1
 
     def upsert(self, icao: str, seen_at: float, fresh: bool, **fields) -> None:
         with self._lock:
+            if self._ref is not None and fields.get("lat") is not None and fields.get("lon") is not None:
+                if self._km(self._ref[0], self._ref[1], fields["lat"], fields["lon"]) > self._max_km:
+                    fields = dict(fields, lat=None, lon=None)
+                    self.rejected_positions += 1
             ac = self._ac.get(icao)
             if ac is None:
                 ac = Aircraft(icao=icao, first_seen=seen_at, last_seen=seen_at)
@@ -213,11 +248,13 @@ class Dump1090Controller:
 
     def __init__(self, binary: Optional[str] = None, json_dir: str = "", extra_args: Optional[List[str]] = None,
                  host: str = DUMP1090_HOST, raw_port: int = DUMP1090_RAW_PORT,
-                 use_raw: bool = True, stop_evt: Optional[threading.Event] = None):
+                 use_raw: bool = True, stop_evt: Optional[threading.Event] = None,
+                 sbs_port: int = DUMP1090_SBS_PORT):
         self.binary = binary or self.find_binary()
         self.json_dir = json_dir
         self.extra_args = list(extra_args or [])
-        self.host, self.raw_port = host, raw_port
+        self.host, self.raw_port, self.sbs_port = host, raw_port, sbs_port
+        self.external_json_dir = ""
         self.use_raw = bool(use_raw and HAVE_PYMODES)
         self.stop_evt = stop_evt or threading.Event()
         self.process: Optional[subprocess.Popen] = None
@@ -249,11 +286,39 @@ class Dump1090Controller:
         except (OSError, socket.timeout):
             return False
 
+    @staticmethod
+    def find_external_json_dir() -> str:
+        """A running decoder's aircraft.json that was updated in the last 10 s (e.g. the dump1090-fa service)."""
+        for d in COMMON_JSON_DIRS:
+            try:
+                if time.time() - os.stat(os.path.join(d, "aircraft.json")).st_mtime < 10:
+                    return d
+            except OSError:
+                continue
+        return ""
+
     def ensure_running(self) -> bool:
+        """Adopt a decoder that is already running (raw :30002, then aircraft.json, then SBS :30003),
+        otherwise start our own. An existing service holds the dongle, so spawning a second one would fail."""
         if self.use_raw and self.is_port_open():
-            self.mode = "raw"  # an external decoder is already serving :30002
+            self.mode = "raw"
+            return True
+        self.external_json_dir = self.find_external_json_dir()
+        if self.external_json_dir:
+            self.mode = "json"
+            return True
+        if self.is_port_open(self.sbs_port):
+            self.mode = "sbs"
             return True
         return self.spawn()
+
+    def external_alive(self) -> bool:
+        """Is the adopted (not spawned) decoder still there?"""
+        if self.mode == "raw":
+            return self.is_port_open()
+        if self.mode == "json":
+            return bool(self.external_json_dir) and self.find_external_json_dir() == self.external_json_dir
+        return self.is_port_open(self.sbs_port)
 
     def alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -388,7 +453,7 @@ class AircraftTracker(threading.Thread):
                         while b"\n" in buf:
                             line, buf = buf.split(b"\n", 1)
                             self._handle_raw_line(line.strip())
-            except (ConnectionRefusedError, OSError) as exc:
+            except Exception as exc:  # connection problems and anything unexpected: reconnect
                 self.last_error = str(exc)
             self._set_feed(False)
             self.halt.wait(3)
@@ -418,6 +483,9 @@ class AircraftTracker(threading.Thread):
                 alt = pms.adsb.altitude(msg)
                 if alt is not None:
                     fields["altitude_ft"] = int(alt)
+            elif tc == 28:  # aircraft status: squawk + emergency state (subtype 1 only)
+                if pms.common.bin2int(pms.common.hex2bin(msg)[32:][5:8]) == 1:
+                    fields["squawk"] = str(pms.bds.bds61.emergency_squawk(msg))
             elif tc == 19:
                 vel = pms.adsb.velocity(msg)
                 if vel is not None:
@@ -490,40 +558,50 @@ class JsonSource(threading.Thread):
             except (OSError, ValueError):
                 self.stats.feed_ok = False
             if isinstance(data, dict):
-                self._ingest(data)
+                try:
+                    self._ingest(data)
+                except Exception as exc:  # one odd record must never kill the feed thread
+                    self.stats.feed_note = f"json feed: {type(exc).__name__}: {exc}"[:90]
             self.stop_evt.wait(1.0)
 
     def _ingest(self, data: dict) -> None:
         now = time.time()
         total = data.get("messages")
-        if isinstance(total, int):
+        if isinstance(total, int) and not isinstance(total, bool):
             self.stats.msgs_total = total
         seen_ids = set()
-        for a in data.get("aircraft", []):
-            icao = str(a.get("hex", "")).strip().upper()
-            if not HEX6.fullmatch(icao):  # skips '~' non-ICAO (TIS-B) addresses
+        records = data.get("aircraft")
+        for a in (records if isinstance(records, list) else []):
+            try:
+                self._ingest_one(a, now, seen_ids)
+            except Exception:
                 continue
-            seen_ids.add(icao)
-            msgs = int(a.get("messages", 0) or 0)
-            seen = to_float(a.get("seen")) or 0.0
-            prev = self._last_msgs.get(icao)
-            fresh = (seen < 2.0) if prev is None else (msgs > prev)
-            self._last_msgs[icao] = msgs
-            alt_raw = a.get("alt_baro", a.get("altitude", a.get("alt_geom")))
-            on_ground = isinstance(alt_raw, str) and alt_raw.lower() == "ground"
-            alt = None if on_ground else to_float(alt_raw)
-            self.table.upsert(
-                icao, now - seen, fresh,
-                callsign=str(a.get("flight") or "").strip(),
-                squawk=str(a.get("squawk") or ""),
-                altitude_ft=alt, on_ground=on_ground,
-                speed_kt=to_float(a.get("gs", a.get("speed"))),
-                heading_deg=to_float(a.get("track")),
-                lat=to_float(a.get("lat")), lon=to_float(a.get("lon")),
-                rssi=to_float(a.get("rssi")), messages=msgs,
-            )
         for k in [k for k in self._last_msgs if k not in seen_ids]:
             del self._last_msgs[k]
+
+    def _ingest_one(self, a: dict, now: float, seen_ids: set) -> None:
+        icao = str(a.get("hex", "")).strip().upper()
+        if not HEX6.fullmatch(icao):  # skips '~' non-ICAO (TIS-B) addresses
+            return
+        seen_ids.add(icao)
+        msgs = to_int(a.get("messages")) or 0
+        seen = to_float(a.get("seen")) or 0.0
+        prev = self._last_msgs.get(icao)
+        fresh = (seen < 2.0) if prev is None else (msgs > prev)
+        self._last_msgs[icao] = msgs
+        alt_raw = a.get("alt_baro", a.get("altitude", a.get("alt_geom")))
+        on_ground = isinstance(alt_raw, str) and alt_raw.lower() == "ground"
+        alt = None if on_ground else to_float(alt_raw)
+        self.table.upsert(
+            icao, now - seen, fresh,
+            callsign=str(a.get("flight") or "").strip(),
+            squawk=str(a.get("squawk") or ""),
+            altitude_ft=alt, on_ground=on_ground,
+            speed_kt=to_float(a.get("gs", a.get("speed"))),
+            heading_deg=to_float(a.get("track")),
+            lat=to_float(a.get("lat")), lon=to_float(a.get("lon")),
+            rssi=to_float(a.get("rssi")), messages=msgs,
+        )
 
 
 class RssiSource(threading.Thread):
@@ -548,7 +626,7 @@ class RssiSource(threading.Thread):
                         if rssi is not None and HEX6.fullmatch(icao):
                             self.table.update_existing(icao, rssi=rssi)
                             got = True
-            except (OSError, ValueError, AttributeError):
+            except Exception:  # unreadable / half-written / odd JSON: just try again next second
                 pass
             self.stats.rssi_ok = got
             self.stop_evt.wait(1.0)
@@ -581,7 +659,10 @@ class SbsSource(threading.Thread):
                         buf += data
                         *lines, buf = buf.split(b"\n")
                         for ln in lines:
-                            self._line(ln.decode("ascii", "ignore").strip())
+                            try:
+                                self._line(ln.decode("ascii", "ignore").strip())
+                            except Exception:
+                                continue
             except OSError:
                 pass
             self.stats.feed_ok = False

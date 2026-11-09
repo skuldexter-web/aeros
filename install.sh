@@ -78,11 +78,11 @@ esac
 # serial-port permissions: /dev/ttyACM* and /dev/ttyUSB* belong to group dialout
 TARGET_USER="${SUDO_USER:-$(id -un)}"
 if [ "$TARGET_USER" != "root" ] && getent group dialout >/dev/null 2>&1; then
-  if id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx dialout; then
-    say "user ${TARGET_USER} is already in the dialout group"
-  else
-    $SUDO usermod -aG dialout "$TARGET_USER" && say "added ${TARGET_USER} to dialout (log out/in to apply; AERØS re-launches itself with sg when needed)"
-  fi
+  # (no pipe into grep -q: under pipefail an early-exiting grep can fail the pipeline spuriously)
+  case " $(id -nG "$TARGET_USER") " in
+    *" dialout "*) say "user ${TARGET_USER} is already in the dialout group" ;;
+    *) $SUDO usermod -aG dialout "$TARGET_USER" && say "added ${TARGET_USER} to dialout (log out/in to apply; AERØS re-launches itself with sg when needed)" ;;
+  esac
 fi
 
 # --- full setup (RTL-SDR, gpsd, udev, dump1090 build) -------------------------

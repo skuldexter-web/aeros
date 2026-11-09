@@ -48,8 +48,8 @@ except ImportError:  # pragma: no cover
     serial = None
 
 from airplanes import (  # noqa: E402  (decoder side lives in airplanes.py)
-    HAVE_PYMODES, PYMODES_ERROR, AircraftTable, AircraftTracker, Dump1090Controller,
-    JsonSource, RssiSource, SbsSource, explain_sdr_error,
+    COMMON_JSON_DIRS, EMERGENCY_SQUAWKS, HAVE_PYMODES, PYMODES_ERROR, AircraftTable, AircraftTracker,
+    Dump1090Controller, JsonSource, RssiSource, SbsSource, explain_sdr_error, to_float,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ from airplanes import (  # noqa: E402  (decoder side lives in airplanes.py)
 # ─────────────────────────────────────────────────────────────────────────────
 APP_NAME = "AERØS"
 APP_ID = "AEROS"
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 SUBTITLE = "passive aircraft tracking"
 GITHUB = "github.com/skuldexter-web"
 HANDLE = "@s.k.7.l.d"
@@ -86,9 +86,6 @@ def banner_lines(ascii_only: bool = False) -> List[str]:
 
 
 UNIT_FACTORS = {"km": 1.0, "nm": 0.539957, "mi": 0.621371}
-
-COMMON_JSON_DIRS = ["/run/dump1090-fa", "/run/readsb", "/run/dump1090-mutability", "/run/dump1090",
-                    "/var/run/dump1090-fa", "/var/run/readsb"]
 
 APT_PACKAGES = [
     "rtl-sdr", "librtlsdr-dev", "gpsd", "gpsd-clients", "python3-pip", "build-essential",
@@ -410,7 +407,7 @@ def reexec_with_dialout() -> None:
 
 def prepare_usb_serial(args: argparse.Namespace, fix: bool = True) -> None:
     """Startup hardware prep for u-blox USB GPS: kernel driver + serial-port permissions."""
-    state, msg = ensure_cdc_acm(fix)
+    _state, msg = ensure_cdc_acm(fix)
     say(f"USB-serial driver: {msg}")
     in_db, in_session = dialout_state()
     user = os.environ.get("SUDO_USER") or getpass.getuser()
@@ -754,14 +751,18 @@ class GpsSupervisor(threading.Thread):
             self._status("DISABLED", "GPS disabled (--gps none)")
             return
         while not self.stop_evt.is_set():
-            locked = False
-            if a.gps in ("auto", "gpsd"):
-                locked = self._gpsd_session()
-            if not locked and a.gps in ("auto", "serial"):
-                self._scan_no += 1
-                locked = self._serial_scan()
-            if not locked and a.gps == "gpsd":
-                self._status("NO DEVICE", self._note or "gpsd has no GPS")
+            try:
+                locked = False
+                if a.gps in ("auto", "gpsd"):
+                    locked = self._gpsd_session()
+                if not locked and a.gps in ("auto", "serial"):
+                    self._scan_no += 1
+                    locked = self._serial_scan()
+                if not locked and a.gps == "gpsd":
+                    self._status("NO DEVICE", self._note or "gpsd has no GPS")
+            except Exception as exc:  # the GPS thread must never die silently
+                self._status("ERROR", f"{type(exc).__name__}: {exc}"[:90])
+                self.stop_evt.wait(3.0)
             self.stop_evt.wait(2.0)  # keep scanning until a responding u-blox is found (also handles hot-plug)
 
     # -- gpsd ----------------------------------------------------------------
@@ -804,7 +805,7 @@ class GpsSupervisor(threading.Thread):
 
     def _gpsd_note_device(self, d: dict) -> None:
         path = d.get("path")
-        if not path:
+        if not isinstance(path, str) or not path:
             return
         rec = self._gdev.setdefault(path, {"first": time.monotonic(), "driver": ""})
         if d.get("driver"):
@@ -838,8 +839,16 @@ class GpsSupervisor(threading.Thread):
 
     def _handle_gpsd(self, raw: bytes, name: str) -> bool:
         try:
+            return self._handle_gpsd_msg(raw, name)
+        except (TypeError, ValueError, AttributeError, KeyError, OverflowError):
+            return False  # malformed message: ignore it, keep the session
+
+    def _handle_gpsd_msg(self, raw: bytes, name: str) -> bool:
+        try:
             msg = json.loads(raw.decode("utf-8", "replace"))
         except ValueError:
+            return False
+        if not isinstance(msg, dict):
             return False
         cls = msg.get("class")
         if cls == "DEVICES":
@@ -854,7 +863,7 @@ class GpsSupervisor(threading.Thread):
         if cls == "TPV":
             if not self._gpsd_gate(msg):
                 return True
-            mode = int(msg.get("mode", 0) or 0)
+            mode = int(to_float(msg.get("mode")) or 0)
             kw = {"mode": mode, "status": GPS_STATUS.get(mode, "NO FIX"), "error": "",
                   "source": f"{name} (u-blox)"}
             for key, dest in (("lat", "lat"), ("lon", "lon"), ("speed", "speed_ms"),
@@ -1045,6 +1054,15 @@ class Stats:
         self.msgs_rate = 0.0
         self.log_rows = 0
         self.logging_note = ""
+        self.feed_note = ""
+        self.silent_s = 0.0                 # seconds since the last decoded frame
+        self.max_range_km = 0.0             # farthest aircraft position heard this session
+        self.max_range_icao = ""
+        self.max_range_brg = 0.0
+        self.sector_max = [0.0] * 24        # farthest range per 15-degree bearing sector
+        self.emergency = ""                 # active 7500/7600/7700 squawk, if any
+        self.pos_rejected = 0
+        self.rx_km = 0.0                    # distance the receiver itself travelled
 
 
 def extra_decoder_args(args: argparse.Namespace) -> List[str]:
@@ -1080,12 +1098,13 @@ class SdrSupervisor(threading.Thread):
                 continue
             external = ctl.process is None
             if external:
+                where = {"raw": f":{ctl.raw_port}", "sbs": f":{ctl.sbs_port}", "json": ctl.external_json_dir}[ctl.mode]
                 self.stats.sdr_state = "EXTERNAL"
-                self.stats.sdr_detail = f"existing decoder on :{ctl.raw_port} [raw]"
+                self.stats.sdr_detail = f"existing decoder {where} [{ctl.mode}]"
             else:
                 self.stats.sdr_state, self.stats.sdr_detail = "RUNNING", f"{name} [{ctl.mode}]"
             self.on_started(ctl.mode, external)
-            while not self.stop_evt.is_set() and (ctl.is_port_open() if external else ctl.alive()):
+            while not self.stop_evt.is_set() and (ctl.external_alive() if external else ctl.alive()):
                 self.stop_evt.wait(1.0)
             if self.stop_evt.is_set():
                 break
@@ -1133,15 +1152,99 @@ def _fmt(v: Optional[float], spec: str) -> str:
     return "" if v is None else format(v, spec)
 
 
+KML_STYLES = (
+    '<Style id="rx"><IconStyle><color>ffff55aa</color><scale>0.7</scale><Icon>'
+    "<href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon></IconStyle></Style>\n"
+    '<Style id="trk"><LineStyle><color>fff0e000</color><width>2</width></LineStyle></Style>\n'
+    '<Style id="rxtrk"><LineStyle><color>ffffffff</color><width>3</width></LineStyle></Style>\n'
+)
+
+
+def kml_placemark(utc: str, rx_lat: str, rx_lon: str, rx_alt: str, icao: str, callsign: str,
+                  alt_ft: str, speed: str, rssi: str, dist: str) -> str:
+    label = icao + (f" {callsign}" if callsign else "")
+    desc = (f"ICAO {icao} callsign {callsign} alt {alt_ft} ft speed {speed} kt "
+            f"RSSI {rssi} dBFS distance {dist} km")
+    return (f"<Placemark><name>{xml_escape(label)}</name><styleUrl>#rx</styleUrl>"
+            f"<description>{xml_escape(desc)}</description><TimeStamp><when>{xml_escape(utc)}</when></TimeStamp>"
+            f"<Point><coordinates>{rx_lon},{rx_lat},{rx_alt or '0'}</coordinates></Point></Placemark>\n")
+
+
+def _decimate(points: List[str], cap: int) -> None:
+    if len(points) > cap:
+        points[:] = points[::2]
+
+
+def write_kml_file(path: str, name: str, chunks, tracks: Dict[str, List[str]], rx_track: List[str]) -> None:
+    """Stream a KML document to disk: header, receiver track, observation chunks (bytes), aircraft tracks.
+    `tracks` is read after `chunks` is exhausted, so the offline rebuild can fill it while streaming."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as out:
+        out.write(('<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Document>\n'
+                   f"<name>{xml_escape(name)}</name>\n" + KML_STYLES).encode("utf-8"))
+        if len(rx_track) >= 2:
+            out.write(("<Placemark><name>Receiver track</name><styleUrl>#rxtrk</styleUrl><LineString>"
+                       f"<coordinates>{' '.join(rx_track)}</coordinates></LineString></Placemark>\n").encode("utf-8"))
+        out.write(b"<Folder><name>Receiver observations</name>\n")
+        for chunk in chunks:
+            out.write(chunk)
+        out.write(b"</Folder>\n<Folder><name>Aircraft tracks</name>\n")
+        for icao, pts in tracks.items():
+            if len(pts) >= 2:
+                out.write((f"<Placemark><name>{xml_escape(icao)}</name><styleUrl>#trk</styleUrl>"
+                           f"<LineString><altitudeMode>absolute</altitudeMode>"
+                           f"<coordinates>{' '.join(pts)}</coordinates></LineString></Placemark>\n").encode("utf-8"))
+        out.write(b"</Folder>\n</Document></kml>\n")
+    os.replace(tmp, path)
+
+
+def kml_from_log(log_path: str, kml_path: Optional[str] = None) -> str:
+    """Rebuild a KML from an AEROS_*.log (streaming, constant memory). Also the crash-recovery tool."""
+    kml_path = kml_path or (os.path.splitext(log_path)[0] + ".kml")
+    tracks: Dict[str, List[str]] = collections.OrderedDict()
+    rx_track: List[str] = []
+
+    def chunks():
+        with open(log_path, newline="", encoding="utf-8") as fh:
+            for r in csv.DictReader(fh):
+                try:
+                    float(r["rx_lat"]), float(r["rx_lon"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if not rx_track or rx_track[-1].split(",")[:2] != [r["rx_lon"], r["rx_lat"]]:
+                    rx_track.append(f"{r['rx_lon']},{r['rx_lat']},{r.get('rx_alt_m') or 0}")
+                    _decimate(rx_track, 20000)
+                if r.get("ac_lat") and r.get("ac_lon"):
+                    try:
+                        alt_m = float(r["ac_alt_ft"]) * 0.3048 if r.get("ac_alt_ft") else 0.0
+                    except ValueError:
+                        alt_m = 0.0
+                    pts = tracks.setdefault(r["icao"], [])
+                    pts.append(f"{r['ac_lon']},{r['ac_lat']},{alt_m:.0f}")
+                    _decimate(pts, 3000)
+                yield kml_placemark(r["utc"], r["rx_lat"], r["rx_lon"], r.get("rx_alt_m", ""), r["icao"],
+                                    r.get("callsign", ""), r.get("ac_alt_ft", ""), r.get("ac_speed_kt", ""),
+                                    r.get("rssi_dbfs", ""), r.get("distance_km", "")).encode("utf-8")
+
+    write_kml_file(kml_path, os.path.basename(os.path.splitext(log_path)[0]), chunks(), tracks, rx_track)
+    return kml_path
+
+
 class WardriveLogger:
+    """Streams every sighting to disk the moment it happens (.log full detail, .csv WiGLE-style) and keeps a
+    KML observation fragment (.kml.part) alongside, so building the KML is a cheap copy, never a re-parse."""
+
     def __init__(self, outdir: str, stamp: str, wigle_type: str):
         os.makedirs(outdir, exist_ok=True)
         base = os.path.join(outdir, f"{APP_ID}_{stamp}")
         self.base = base
         self.log_path, self.csv_path, self.kml_path = base + ".log", base + ".csv", base + ".kml"
+        self.part_path = base + ".kml.part"
         self.wigle_type = wigle_type
         self.rows = 0
+        self.rx_km = 0.0
         self._lock = threading.Lock()
+        self._kml_busy = threading.Lock()
         self._log = open(self.log_path, "w", newline="", encoding="utf-8")
         self._lw = csv.writer(self._log, lineterminator="\n")
         self._lw.writerow(FULL_COLUMNS)
@@ -1151,6 +1254,11 @@ class WardriveLogger:
                         f"device={APP_ID},display=,board=,brand=skuldexter-web\n")
         self._ww = csv.writer(self._wig, lineterminator="\n")
         self._ww.writerow(WIGLE_COLUMNS)
+        self._part = open(self.part_path, "w", encoding="utf-8")
+        self._part_bytes = 0
+        self._tracks: Dict[str, List[str]] = collections.OrderedDict()
+        self._rx_track: List[str] = []
+        self._rx_last: Optional[Tuple[float, float, float]] = None
         self._flush()
 
     def _flush(self) -> None:
@@ -1159,9 +1267,10 @@ class WardriveLogger:
 
     def add(self, s: Sighting) -> None:
         when = dt.datetime.fromtimestamp(s.utc, dt.timezone.utc)
+        iso = when.strftime("%Y-%m-%dT%H:%M:%SZ")
         with self._lock:
             self._lw.writerow([
-                when.strftime("%Y-%m-%dT%H:%M:%SZ"), f"{s.rx_lat:.7f}", f"{s.rx_lon:.7f}",
+                iso, f"{s.rx_lat:.7f}", f"{s.rx_lon:.7f}",
                 _fmt(s.rx_alt, ".1f"), f"{s.rx_acc:.1f}", "" if s.sats is None else s.sats,
                 s.icao, s.callsign, s.squawk, _fmt(s.alt_ft, ".0f"), _fmt(s.speed_kt, ".0f"),
                 _fmt(s.track, ".0f"), _fmt(s.ac_lat, ".6f"), _fmt(s.ac_lon, ".6f"),
@@ -1175,92 +1284,141 @@ class WardriveLogger:
             ])
             self.rows += 1
             self._flush()
+            xml = kml_placemark(iso, f"{s.rx_lat:.7f}", f"{s.rx_lon:.7f}", _fmt(s.rx_alt, ".1f"), s.icao, s.callsign,
+                                _fmt(s.alt_ft, ".0f"), _fmt(s.speed_kt, ".0f"), _fmt(s.rssi, ".1f"),
+                                _fmt(s.dist_km, ".2f"))
+            self._part.write(xml)
+            self._part_bytes += len(xml.encode("utf-8"))
+            if s.ac_lat is not None and s.ac_lon is not None:
+                pts = self._tracks.setdefault(s.icao, [])
+                pts.append(f"{s.ac_lon:.6f},{s.ac_lat:.6f},{((s.alt_ft or 0.0) * 0.3048):.0f}")
+                _decimate(pts, 3000)
 
-    def write_kml(self) -> None:
-        """Rebuild the KML from the .log (receiver observations + aircraft tracks)."""
+    def add_track_point(self, lat: float, lon: float, alt: Optional[float]) -> None:
+        """Receiver path (white line in the KML). Sampled when moved >=10 m, thinned if it grows huge."""
         with self._lock:
-            self._flush()
-            try:
-                with open(self.log_path, newline="", encoding="utf-8") as fh:
-                    rows = list(csv.DictReader(fh))
-            except OSError:
-                return
-        tmp = self.kml_path + ".tmp"
-        tracks: Dict[str, List[str]] = collections.OrderedDict()
-        with open(tmp, "w", encoding="utf-8") as out:
-            out.write('<?xml version="1.0" encoding="UTF-8"?>\n'
-                      '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>\n'
-                      f"<name>{xml_escape(os.path.basename(self.base))}</name>\n"
-                      '<Style id="rx"><IconStyle><color>ffff55aa</color><scale>0.7</scale><Icon>'
-                      "<href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href>"
-                      "</Icon></IconStyle></Style>\n"
-                      '<Style id="trk"><LineStyle><color>fff0e000</color><width>2</width></LineStyle></Style>\n'
-                      "<Folder><name>Receiver observations</name>\n")
-            for r in rows:
-                try:
-                    rx_lat, rx_lon = float(r["rx_lat"]), float(r["rx_lon"])
-                except (KeyError, ValueError):
-                    continue
-                rx_alt = r.get("rx_alt_m") or "0"
-                label = r["icao"] + (f" {r['callsign']}" if r.get("callsign") else "")
-                desc = (f"ICAO {r['icao']} callsign {r.get('callsign', '')} alt {r.get('ac_alt_ft', '')} ft "
-                        f"speed {r.get('ac_speed_kt', '')} kt RSSI {r.get('rssi_dbfs', '')} dBFS "
-                        f"distance {r.get('distance_km', '')} km")
-                out.write(f"<Placemark><name>{xml_escape(label)}</name><styleUrl>#rx</styleUrl>"
-                          f"<description>{xml_escape(desc)}</description>"
-                          f"<TimeStamp><when>{r['utc']}</when></TimeStamp>"
-                          f"<Point><coordinates>{rx_lon},{rx_lat},{rx_alt}</coordinates></Point></Placemark>\n")
-                if r.get("ac_lat") and r.get("ac_lon"):
-                    alt_m = (float(r["ac_alt_ft"]) * 0.3048) if r.get("ac_alt_ft") else 0.0
-                    tracks.setdefault(r["icao"], []).append(f"{r['ac_lon']},{r['ac_lat']},{alt_m:.0f}")
-            out.write("</Folder>\n<Folder><name>Aircraft tracks</name>\n")
-            for icao, pts in tracks.items():
-                if len(pts) >= 2:
-                    out.write(f"<Placemark><name>{xml_escape(icao)}</name><styleUrl>#trk</styleUrl>"
-                              f"<LineString><altitudeMode>absolute</altitudeMode>"
-                              f"<coordinates>{' '.join(pts)}</coordinates></LineString></Placemark>\n")
-            out.write("</Folder>\n</Document></kml>\n")
-        os.replace(tmp, self.kml_path)
+            if self._rx_last is not None:
+                moved = haversine_km(self._rx_last[0], self._rx_last[1], lat, lon) * 1000.0
+                if moved < 10.0:
+                    return
+                self.rx_km += moved / 1000.0
+            self._rx_last = (lat, lon, alt or 0.0)
+            self._rx_track.append(f"{lon:.6f},{lat:.6f},{(alt or 0.0):.0f}")
+            _decimate(self._rx_track, 20000)
+
+    def write_kml(self, final: bool = False) -> None:
+        """Compose the KML from the observation fragment. Cheap (file copy), safe to call from any thread."""
+        if not self._kml_busy.acquire(blocking=final):
+            return  # a periodic save is already running; the next one will catch up
+        try:
+            with self._lock:
+                self._flush()
+                self._part.flush()
+                size = self._part_bytes
+                tracks = {k: list(v) for k, v in self._tracks.items() if len(v) >= 2}
+                rx_track = list(self._rx_track)
+
+            def chunks():
+                with open(self.part_path, "rb") as fh:
+                    left = size
+                    while left > 0:
+                        block = fh.read(min(1 << 20, left))
+                        if not block:
+                            break
+                        left -= len(block)
+                        yield block
+
+            write_kml_file(self.kml_path, os.path.basename(self.base), chunks(), tracks, rx_track)
+            if final:
+                with self._lock:
+                    try:
+                        self._part.close()
+                        os.remove(self.part_path)
+                    except OSError:
+                        pass
+        finally:
+            self._kml_busy.release()
 
     def close(self) -> None:
         with self._lock:
-            for fh in (self._log, self._wig):
+            for fh in (self._log, self._wig, self._part):
                 try:
                     fh.flush()
                     fh.close()
-                except OSError:
+                except (OSError, ValueError):
                     pass
 
 
 class WardriveEngine(threading.Thread):
-    """Once per second: correlate freshly received aircraft with the current GPS fix and log them."""
+    """Once per second: correlate freshly received aircraft with the current GPS fix and log them.
+    Also keeps session statistics (range, coverage per bearing, alerts) and never lets an error kill logging."""
 
     def __init__(self, table: AircraftTable, gps: GpsSupervisor, logger: WardriveLogger,
-                 stats: Stats, stop: threading.Event, interval: float, move_m: float):
+                 stats: Stats, stop: threading.Event, interval: float, move_m: float, max_range_km: float = 650.0):
         super().__init__(daemon=True, name="engine")
         self.table, self.gps, self.logger = table, gps, logger
         self.stats, self.stop_evt = stats, stop
-        self.interval, self.move_m = interval, move_m
+        self.interval, self.move_m, self.max_range_km = interval, move_m, max_range_km
         self._last: Dict[str, Tuple[float, float, float]] = {}
+        self._last_total = 0
+        self._last_t = time.monotonic()
+        self._last_frame_wall = time.time()
+        self._log_error = ""   # sticky: stays visible until a write succeeds again
 
     def run(self) -> None:
-        last_total, last_t = 0, time.monotonic()
         while not self.stop_evt.wait(1.0):
-            now = time.monotonic()
-            total = self.stats.msgs_total
-            if now > last_t:
-                self.stats.msgs_rate = max(0.0, (total - last_total) / (now - last_t))
-            last_total, last_t = total, now
-            fresh = self.table.drain_fresh()
-            fix = self.gps.snapshot()
-            if not fix.has_fix:
-                self.stats.logging_note = "waiting for GPS fix — not logging"
+            try:
+                self._tick()
+            except Exception as exc:  # e.g. a full disk: report it and keep trying every second
+                self._log_error = f"LOG ERROR: {type(exc).__name__}: {exc}"[:90]
+                self.stats.logging_note = self._log_error
+
+    def _tick(self) -> None:
+        st = self.stats
+        now = time.monotonic()
+        total = st.msgs_total
+        if now > self._last_t:
+            st.msgs_rate = max(0.0, (total - self._last_total) / (now - self._last_t))
+        if total != self._last_total:
+            self._last_frame_wall = time.time()
+        self._last_total, self._last_t = total, now
+        st.silent_s = time.time() - self._last_frame_wall if st.sdr_state in ("RUNNING", "EXTERNAL") else 0.0
+        fresh = self.table.drain_fresh()
+        fix = self.gps.snapshot()
+        st.pos_rejected = self.table.rejected_positions
+        if fix.has_fix:
+            self.table.set_reference(fix.lat, fix.lon, self.max_range_km)
+            self._coverage(fix)
+        else:
+            self.table.set_reference(None, None, 0.0)
+        st.emergency = ""
+        for ac in self.table.snapshot(120.0):
+            if ac.squawk in EMERGENCY_SQUAWKS:
+                st.emergency = f"{ac.squawk} {EMERGENCY_SQUAWKS[ac.squawk]}  {ac.icao} {ac.callsign}".strip()
+                break
+        if not fix.has_fix:
+            st.logging_note = "waiting for GPS fix — not logging"
+            return
+        st.logging_note = self._log_error
+        self.logger.add_track_point(fix.lat, fix.lon, fix.alt)
+        st.rx_km = self.logger.rx_km
+        for ac in fresh:
+            self._maybe_log(ac, fix, now)
+        if len(self._last) > 5000:
+            self._last = {k: v for k, v in self._last.items() if now - v[0] < 600}
+
+    def _coverage(self, fix: GpsFix) -> None:
+        st = self.stats
+        for ac in self.table.snapshot(10.0):
+            d_nm, brg = ac.distance_bearing_from(fix.lat, fix.lon)
+            if d_nm is None or brg is None:
                 continue
-            self.stats.logging_note = ""
-            for ac in fresh:
-                self._maybe_log(ac, fix, now)
-            if len(self._last) > 5000:
-                self._last = {k: v for k, v in self._last.items() if now - v[0] < 600}
+            km = d_nm * 1.852
+            sector = int(brg // 15) % 24
+            if km > st.sector_max[sector]:
+                st.sector_max[sector] = km
+            if km > st.max_range_km:
+                st.max_range_km, st.max_range_icao, st.max_range_brg = km, ac.icao, brg
 
     def _maybe_log(self, ac, fix: GpsFix, now: float) -> None:
         # raw mode merges RSSI from aircraft.json about a second late: give a brand-new aircraft up to 3 s
@@ -1284,14 +1442,16 @@ class WardriveEngine(threading.Thread):
         ))
         self._last[ac.icao] = (now, fix.lat, fix.lon)
         self.stats.log_rows = self.logger.rows
+        self._log_error = ""
+        self.stats.logging_note = ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Application / curses terminal UI
 # ─────────────────────────────────────────────────────────────────────────────
-ROW_FMT = "{:<6}  {:<8}  {:>9}  {:>7}  {:>7}  {:>4}  {:>7}  {:>5}"
-TABLE_WIDTH = 67
-RANGE_STEPS_KM = [10, 25, 50, 100, 200, 300, 450]
+ROW_FMT = "{:<6}  {:<8}  {:>4}  {:>9}  {:>7}  {:>7}  {:>4}  {:>7}  {:>5}"
+TABLE_WIDTH = 73
+RANGE_STEPS_KM = [10, 25, 50, 100, 200, 300, 450, 700]
 ARROWS = ["↑", "↗", "→", "↘", "↓", "↙", "←", "↖"]
 ARROWS_ASCII = ["^", "/", ">", "\\", "v", "/", "<", "\\"]
 
@@ -1310,15 +1470,21 @@ class App:
         self.source_mode = ""
         self.json_dir = ""
         self._src_lock = threading.Lock()
-        self.banner = banner_lines(args.ascii)
-        self.sep = "-" if args.ascii else "─"
-        self.dot = "|" if args.ascii else "·"
-        self.ring = "." if args.ascii else "·"
-        self.arrows = ARROWS_ASCII if args.ascii else ARROWS
         self.view = "auto"            # auto | table | radar
         self.range_km: Optional[float] = None  # None = auto-range
-        self.A_PURPLE = 0
-        self.A_CYAN = 0
+        self.t_start = time.time()
+        self.A_PURPLE = curses.A_BOLD
+        self.A_CYAN = curses.A_NORMAL
+        self._set_charset(args.ascii)
+
+    def _set_charset(self, ascii_only: bool) -> None:
+        self.ascii = ascii_only
+        self.banner = banner_lines(ascii_only)
+        self.sep = "-" if ascii_only else "─"
+        self.dot = "|" if ascii_only else "·"
+        self.ring = "." if ascii_only else "·"
+        self.cov = "o" if ascii_only else "◦"
+        self.arrows = ARROWS_ASCII if ascii_only else ARROWS
 
     # -- data source management ---------------------------------------------
     def _rssi_dir(self, external: bool) -> str:
@@ -1368,18 +1534,41 @@ class App:
             entries.sort(key=lambda e: -e[0].last_seen)
         return fix, entries
 
-    # -- curses drawing ------------------------------------------------------
+    # -- terminal preparation ---------------------------------------------------
+    def _prepare_terminal(self) -> None:
+        """Locale + charset: an unsupported locale or a non-UTF-8 terminal must degrade to ASCII, not crash."""
+        try:
+            locale.setlocale(locale.LC_ALL, "")
+        except locale.Error:
+            for loc in ("C.UTF-8", "en_US.UTF-8"):
+                try:
+                    locale.setlocale(locale.LC_ALL, loc)
+                    break
+                except locale.Error:
+                    continue
+        if "utf" not in (locale.getpreferredencoding(False) or "").lower():
+            self._set_charset(True)
+
     def _init_colors(self, scr) -> None:
-        curses.start_color()
-        if curses.COLORS >= 16:
-            purple, cyan, extra = 13, 14, 0      # bright magenta / bright cyan == \033[95m / \033[96m
-        else:
-            purple, cyan, extra = curses.COLOR_MAGENTA, curses.COLOR_CYAN, curses.A_BOLD
-        curses.init_pair(1, purple, curses.COLOR_BLACK)
-        curses.init_pair(2, cyan, curses.COLOR_BLACK)
-        self.A_PURPLE = curses.color_pair(1) | extra
-        self.A_CYAN = curses.color_pair(2) | extra
-        scr.bkgd(" ", self.A_CYAN)             # black background everywhere
+        """Purple banner / cyan data on black. No colour support (TERM=dumb, mono terminals): bold + plain."""
+        self.A_PURPLE, self.A_CYAN = curses.A_BOLD, curses.A_NORMAL
+        try:
+            if not curses.has_colors():
+                return
+            curses.start_color()
+            if curses.COLORS >= 16:
+                purple, cyan, extra = 13, 14, 0      # bright magenta / bright cyan == \033[95m / \033[96m
+            elif curses.COLORS >= 8:
+                purple, cyan, extra = curses.COLOR_MAGENTA, curses.COLOR_CYAN, curses.A_BOLD
+            else:
+                return
+            curses.init_pair(1, purple, curses.COLOR_BLACK)
+            curses.init_pair(2, cyan, curses.COLOR_BLACK)
+            self.A_PURPLE = curses.color_pair(1) | extra
+            self.A_CYAN = curses.color_pair(2) | extra
+            scr.bkgd(" ", self.A_CYAN)             # black background everywhere
+        except (curses.error, ValueError):
+            self.A_PURPLE, self.A_CYAN = curses.A_BOLD, curses.A_NORMAL
 
     @staticmethod
     def _put(scr, y: int, x: int, text: str, attr: int) -> None:
@@ -1388,7 +1577,7 @@ class App:
             return
         try:
             scr.addnstr(y, x, text, cols - x - 1, attr)
-        except curses.error:
+        except (curses.error, UnicodeError):
             pass
 
     def _effective_range(self, entries) -> Tuple[float, bool]:
@@ -1406,17 +1595,18 @@ class App:
         idx = min(range(len(steps)), key=lambda i: abs(steps[i] - cur))
         self.range_km = float(steps[max(0, min(len(steps) - 1, idx + direction))])
 
+    # -- curses drawing ------------------------------------------------------
     def _draw(self, scr, entries_out: list) -> None:
         scr.erase()
         rows, cols = scr.getmaxyx()
         fix, entries = self._collect()
         entries_out[:] = entries
-        st, a = self.stats, self.args
+        st = self.stats
         P, C = self.A_PURPLE, self.A_CYAN
         ALERT = C | curses.A_REVERSE | curses.A_BOLD
         now = time.time()
 
-        # ── pinned header (purple) — redrawn from row 0 on every frame
+        # ── pinned header (purple), redrawn from row 0 on every frame
         y = 0
         if rows >= 24 and cols >= 44:
             for line in self.banner:
@@ -1442,7 +1632,7 @@ class App:
         sats = "-" if fix.sats_used is None else str(fix.sats_used)
         seen = "-" if fix.sats_seen is None else str(fix.sats_seen)
         hdop = "-" if fix.hdop is None else f"{fix.hdop:.1f}"
-        gps_bad = fix.status in ("NO DEVICE", "NO DATA", "DISABLED", "REJECTED", "DISCONNECTED", "NO ACCESS")
+        gps_bad = fix.status in ("NO DEVICE", "NO DATA", "DISABLED", "REJECTED", "DISCONNECTED", "NO ACCESS", "ERROR")
         self._put(scr, y, 1, "GPS  ", C)
         self._put(scr, y, 6, f"{fix.status:<12}", ALERT if gps_bad else C)
         self._put(scr, y, 19, f"sats {sats}/{seen}  hdop {hdop}  {fix.source if fix.source != 'none' else ''}"
@@ -1458,29 +1648,44 @@ class App:
         name = os.path.basename(self.logger.base) if self.logger else "-"
         note = f"  [{st.logging_note}]" if st.logging_note else ""
         self._put(scr, y, 1, f"LOG  {name}  rows {st.log_rows}  aircraft now {len(entries)} / total "
-                             f"{self.table.unique}{note}", C)
+                             f"{self.table.unique}{note}", ALERT if st.logging_note.startswith(("LOG", "KML")) else C)
         y += 1
+        rng = (f"max range {st.max_range_km * UNIT_FACTORS[self.args.units]:.0f}{self.args.units} "
+               f"({st.max_range_icao} @ {st.max_range_brg:.0f}°)") if st.max_range_km > 0 else "max range -"
+        self._put(scr, y, 1, f"STAT {rng}   receiver moved {st.rx_km * UNIT_FACTORS[self.args.units]:.1f}"
+                             f"{self.args.units}   rejected positions {st.pos_rejected}", C)
+        y += 1
+        alerts = []
+        if st.emergency:
+            alerts.append(f" ALERT  squawk {st.emergency} ")
+        if st.sdr_state in ("RUNNING", "EXTERNAL") and st.silent_s > 20:
+            alerts.append(f" NO FRAMES for {st.silent_s:.0f}s: check antenna, gain and dongle ")
+        if st.feed_note:
+            alerts.append(f" {st.feed_note} ")
+        for text in alerts[:2]:
+            self._put(scr, y, 1, text, ALERT)
+            y += 1
         self._put(scr, y, 0, self.sep * (cols - 1), C)
         y += 1
 
         # ── body: table and/or radar scope
         body_h = rows - y - 1
-        both_ok = cols >= 104 and body_h >= 11
+        both_ok = cols >= TABLE_WIDTH + 2 + 38 and body_h >= 11
         show_table, show_radar = {"table": (True, False), "radar": (False, True)}.get(self.view, (True, both_ok))
         if show_table:
-            self._draw_table(scr, y, body_h, fix, entries, now)
+            self._draw_table(scr, y, body_h, entries, now)
         if show_radar:
             x0 = TABLE_WIDTH + 2 if show_table else 0
             self._draw_radar(scr, y, x0, cols - 1 - x0, body_h, fix, entries, now)
-        footer = (f" [q] quit & save  [s] save KML  [v] view:{self.view}  [+/-] range  [a] auto range"
+        footer = (f" [q] quit & save  [s] save KML  [v] view:{self.view}  [+/-] range  [a] auto"
                   f"   RSSI=dBFS")
         self._put(scr, rows - 1, 0, footer, C)
         scr.refresh()
 
-    def _draw_table(self, scr, y0: int, body_h: int, fix, entries, now: float) -> None:
+    def _draw_table(self, scr, y0: int, body_h: int, entries, now: float) -> None:
         C = self.A_CYAN
         u = self.args.units
-        self._put(scr, y0, 0, ROW_FMT.format("ICAO", "CALLSIGN", f"DIST({u})", "ALT(ft)", "SPD(kt)",
+        self._put(scr, y0, 0, ROW_FMT.format("ICAO", "CALLSIGN", "SQK", f"DIST({u})", "ALT(ft)", "SPD(kt)",
                                               "HDG", "RSSI", "SEEN"), C | curses.A_BOLD)
         room = max(0, body_h - 1)
         shown = entries[:room - 1] if len(entries) > room and room > 0 else entries[:room]
@@ -1491,7 +1696,9 @@ class App:
             hdg = "-" if ac.heading_deg is None else f"{ac.heading_deg:.0f}"
             rssi = "n/a" if ac.rssi is None else f"{ac.rssi:.1f}"
             age = f"{max(0, now - ac.last_seen):.0f}s"
-            self._put(scr, y0 + 1 + i, 0, ROW_FMT.format(ac.icao, ac.callsign or "-", d, alt, spd, hdg, rssi, age), C)
+            attr = C | curses.A_REVERSE if ac.squawk in EMERGENCY_SQUAWKS else C
+            self._put(scr, y0 + 1 + i, 0, ROW_FMT.format(ac.icao, ac.callsign or "-", ac.squawk or "-", d, alt,
+                                                          spd, hdg, rssi, age), attr)
         if len(entries) > len(shown) and room > 0:
             self._put(scr, y0 + 1 + len(shown), 0, f"  ... +{len(entries) - len(shown)} more ([v] for full view)", C)
 
@@ -1499,12 +1706,12 @@ class App:
         C = self.A_CYAN
         u = self.args.units
         rng, auto = self._effective_range(entries)
-        self._put(scr, y0, x0, f"RADAR  north-up  range {rng * UNIT_FACTORS[u]:.0f}{u}"
-                               f"{' (auto)' if auto else ''}", C | curses.A_BOLD)
+        self._put(scr, y0, x0, f"RADAR N-up  {rng * UNIT_FACTORS[u]:.0f}{u}{' auto' if auto else ''}  rings "
+                               f"{rng / 3 * UNIT_FACTORS[u]:.0f}/{rng * 2 / 3 * UNIT_FACTORS[u]:.0f}", C | curses.A_BOLD)
         sh = h - 2                      # scope rows (title above, legend below)
         r_rows = (sh - 1) // 2
         r_cols = min(2 * r_rows, (w - 1) // 2 - 1)   # terminal cells are ~2x taller than wide
-        if r_rows < 2 or r_cols < 6:
+        if r_rows < 2 or r_cols < 3:
             self._put(scr, y0 + 1, x0, "(terminal too small for the scope: enlarge it or press [v])", C)
             return
         cy, cx = y0 + 1 + r_rows, x0 + w // 2
@@ -1521,28 +1728,37 @@ class App:
             f = k / 10.0
             self._put(scr, cy - int(round(r_rows * f * math.cos(sweep))),
                       cx + int(round(r_cols * f * math.sin(sweep))), self.ring, C)
+        for i, far in enumerate(self.stats.sector_max):   # coverage: farthest aircraft ever heard per 15° sector
+            if far > 0:
+                frac = min(far / rng, 1.0)
+                th = math.radians(i * 15 + 7.5)
+                self._put(scr, cy - int(round(r_rows * frac * math.cos(th))),
+                          cx + int(round(r_cols * frac * math.sin(th))), self.cov, C)
         self._put(scr, cy, cx, "+", C | curses.A_BOLD)
         if not fix.has_fix:
             self._put(scr, cy + 2, cx - 6, "NO GPS FIX", C | curses.A_REVERSE)
             self._put(scr, cy + 3, cx - 6, "scope idle", C)
             return
-        plotted = 0
+        plotted = beyond = 0
         for ac, dist, brg in entries:
-            if dist is None or brg is None or dist > rng:
+            if dist is None or brg is None:
+                continue
+            if dist > rng:
+                beyond += 1
                 continue
             frac = dist / rng
             th = math.radians(brg)
             py = cy - int(round(r_rows * frac * math.cos(th)))
             px = cx + int(round(r_cols * frac * math.sin(th)))
             sym = "*" if ac.heading_deg is None else self.arrows[int(((ac.heading_deg + 22.5) % 360) // 45)]
-            self._put(scr, py, px, sym, C | curses.A_BOLD)
+            attr = C | curses.A_BOLD | (curses.A_REVERSE if ac.squawk in EMERGENCY_SQUAWKS else 0)
+            self._put(scr, py, px, sym, attr)
             label = (ac.callsign or ac.icao)[:8]
             if px + 2 + len(label) < x0 + w:
                 self._put(scr, py, px + 2, label, C)
             plotted += 1
-        self._put(scr, y0 + h - 1, x0, f"{plotted} plotted, {len(entries)} heard   rings at "
-                                       f"{rng / 3 * UNIT_FACTORS[u]:.0f}/{rng * 2 / 3 * UNIT_FACTORS[u]:.0f}/"
-                                       f"{rng * UNIT_FACTORS[u]:.0f}{u}", C)
+        self._put(scr, y0 + h - 1, x0, f"{plotted} plotted" + (f", {beyond} beyond" if beyond else "") +
+                                       f"  {self.cov}=max range/15°", C)
 
     def _curses_main(self, scr) -> None:
         try:
@@ -1579,23 +1795,47 @@ class App:
             fix = self.gps.snapshot()
             print(f"[{time.strftime('%H:%M:%S')}] sdr={self.stats.sdr_state} gps={fix.status} "
                   f"aircraft={len(self.table.snapshot(self.args.max_age))} rows={self.stats.log_rows} "
-                  f"msgs/s={self.stats.msgs_rate:.0f} feed={self.stats.feed_kind}", flush=True)
+                  f"msgs/s={self.stats.msgs_rate:.0f} feed={self.stats.feed_kind}"
+                  + (f" ALERT={self.stats.emergency}" if self.stats.emergency else ""), flush=True)
             if time.monotonic() >= next_save:
                 self._safe_save()
                 next_save = time.monotonic() + self.args.save_interval
 
-    def _safe_save(self) -> None:
+    def _safe_save(self, final: bool = False) -> None:
+        """KML is built from the observation fragment (cheap) and off the UI thread; the final one is synchronous."""
+        logger = self.logger
+        if logger is None:
+            return
+
+        def work() -> None:
+            try:
+                logger.write_kml(final=final)
+            except Exception as exc:  # never let a save problem kill the UI
+                self.stats.logging_note = f"KML save failed: {exc}"[:90]
+
+        if final:
+            work()
+        else:
+            threading.Thread(target=work, daemon=True, name="kml-save").start()
+
+    def _open_logger(self) -> WardriveLogger:
+        a = self.args
+        stamp = time.strftime("%Y%m%d_%H%M%S")
         try:
-            if self.logger:
-                self.logger.write_kml()
-        except Exception as exc:  # never let a save problem kill the UI
-            self.stats.logging_note = f"KML save failed: {exc}"
+            return WardriveLogger(a.output_dir, stamp, a.wigle_type)
+        except OSError as exc:
+            fallback = os.path.expanduser("~/.local/share/aeros/logs")
+            say(f"{RED}cannot write logs to {a.output_dir!r} ({exc.strerror or exc}); trying {fallback}{RESET}")
+            try:
+                return WardriveLogger(fallback, stamp, a.wigle_type)
+            except OSError as exc2:
+                say(f"{RED}no writable log directory ({exc2.strerror or exc2}). Use --output-dir.{RESET}")
+                raise SystemExit(2)
 
     # -- lifecycle -----------------------------------------------------------
     def run(self) -> int:
         a = self.args
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        self.logger = WardriveLogger(a.output_dir, stamp, a.wigle_type)
+        self.logger = self._open_logger()
         self.json_dir = a.json_dir or tempfile.mkdtemp(prefix="aeros_")
         own_tmp = not a.json_dir
 
@@ -1606,12 +1846,12 @@ class App:
             signal.signal(sig, handler)
 
         engine = WardriveEngine(self.table, self.gps, self.logger, self.stats, self.stop,
-                                a.log_interval, a.log_move)
+                                a.log_interval, a.log_move, a.max_range_km)
         self.gps.start()
         engine.start()
 
         self.ctl = Dump1090Controller(self.binary, self.json_dir, extra_decoder_args(a), a.raw_host, a.raw_port,
-                                      use_raw=not a.no_raw, stop_evt=self.stop)
+                                      use_raw=not a.no_raw, stop_evt=self.stop, sbs_port=a.sbs_port)
         if a.no_spawn:
             self.stats.sdr_state, self.stats.sdr_detail = "EXTERNAL", "using an already-running decoder"
             if self.ctl.use_raw and self.ctl.is_port_open():
@@ -1628,11 +1868,11 @@ class App:
         interactive = sys.stdout.isatty() and sys.stdin.isatty() and not a.no_ui
         try:
             if interactive:
-                locale.setlocale(locale.LC_ALL, "")
+                self._prepare_terminal()
                 try:
                     curses.wrapper(self._curses_main)
-                except curses.error as exc:
-                    say(f"curses unavailable ({exc}); continuing headless")
+                except (curses.error, ValueError, UnicodeError) as exc:
+                    say(f"terminal UI unavailable ({exc}); continuing headless (Ctrl+C to stop)")
                     self._headless_loop()
             else:
                 self._headless_loop()
@@ -1646,11 +1886,17 @@ class App:
                 self.ctl.shutdown()
             for t in (engine, self.gps):
                 t.join(timeout=2.0)
-            self._safe_save()
+            self._safe_save(final=True)
             self.logger.close()
             if own_tmp:
                 shutil.rmtree(self.json_dir, ignore_errors=True)
-        say(f"session ended — {self.logger.rows} rows, {self.table.unique} unique aircraft")
+        st = self.stats
+        minutes = (time.time() - self.t_start) / 60.0
+        say(f"session ended: {self.logger.rows} rows, {self.table.unique} unique aircraft, {minutes:.0f} min")
+        if st.max_range_km > 0:
+            say(f"  farthest aircraft: {st.max_range_km:.0f} km ({st.max_range_icao} at {st.max_range_brg:.0f}°)")
+        say(f"  receiver travelled {self.logger.rx_km:.1f} km; implausible positions rejected: "
+            f"{self.table.rejected_positions}")
         say(f"  {self.logger.csv_path}   (WiGLE-style CSV)")
         say(f"  {self.logger.log_path}   (full detail)")
         say(f"  {self.logger.kml_path}   (Google Earth / KML)")
@@ -1709,6 +1955,8 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--log-interval", type=float, default=5.0, help="min seconds between rows per aircraft (default 5)")
     o.add_argument("--log-move", type=float, default=50.0, help="also log when the receiver moved this many metres (default 50)")
     o.add_argument("--save-interval", type=float, default=60.0, help="seconds between KML rebuilds (default 60)")
+    o.add_argument("--max-range-km", type=float, default=650.0,
+                   help="reject aircraft positions farther than this from the receiver (CPR decode errors); 0 = off")
     o.add_argument("--wigle-type", default="ADSB",
                    help="value for the CSV 'Type' column (default ADSB; see README before changing)")
     u = p.add_argument_group("display")
@@ -1726,6 +1974,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--setup", action="store_true", help="install dependencies, configure udev/gpsd, build dump1090, then exit")
     s.add_argument("--skip-gpsd-config", action="store_true", help="with --setup: leave /etc/default/gpsd alone")
     s.add_argument("--check", action="store_true", help="print a hardware/dependency diagnostic and exit")
+    s.add_argument("--kml-from", metavar="LOG",
+                   help="rebuild the KML from an AEROS_*.log (e.g. after a crash) and exit")
     s.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
     return p
 
@@ -1777,6 +2027,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         say(f"{RED}AERØS targets Linux (Ubuntu, Kali, Mint, Raspberry Pi OS, Debian).{RESET}")
     if args.setup:
         return setup_system(args)
+    if args.kml_from:
+        try:
+            say(f"wrote {kml_from_log(args.kml_from)}")
+            return 0
+        except OSError as exc:
+            say(f"{RED}cannot rebuild KML: {exc}{RESET}")
+            return 2
     distro = detect_distro()
     binary = find_dump1090(args.dump1090)
     if args.check:
@@ -1790,6 +2047,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             say(f"{RED}no dump1090 decoder found.{RESET} Run: python3 aeros.py --setup  (or pass --dump1090 PATH)")
             return 2
         say("no dump1090 decoder found — running automatic setup (sudo password may be requested)")
+        args.skip_gpsd_config = True  # a startup bootstrap installs the decoder; it must not rewrite /etc/default/gpsd
         rc = setup_system(args)
         binary = find_dump1090(args.dump1090)
         if binary is None:
