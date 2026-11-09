@@ -1,2 +1,0 @@
-pyserial>=3.5
-pyModeS>=2.13,<3
